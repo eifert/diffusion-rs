@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::c_char;
 use std::ffi::c_void;
+use std::panic::catch_unwind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::null;
@@ -1202,6 +1203,23 @@ fn gen_img_maybe_progress(
     let prompt: CLibString = CLibString::from(config.prompt.as_str());
     let files = output_files(&config.output, config.batch_count);
     unsafe {
+        struct ScopeGuard;
+        impl Drop for ScopeGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    sd_set_progress_callback(None, null_mut());
+                    sd_set_preview_callback(
+                        None,
+                        PreviewType::PREVIEW_NONE,
+                        0,
+                        false,
+                        false,
+                        null_mut(),
+                    );
+                }
+            }
+        }
+        let _guard = ScopeGuard;
         let has_init_image = config.init_img.exists();
         let has_mask_image = config.mask_img.exists();
 
@@ -1353,10 +1371,10 @@ fn gen_img_maybe_progress(
             _is_noisy: bool,
             data: *mut ::std::os::raw::c_void,
         ) {
-            unsafe {
+            let _ = catch_unwind(|| unsafe {
                 let path = &*data.cast::<PathBuf>();
                 let _ = save_img(*frames, path, None);
-            }
+            });
         }
 
         if config.preview_mode != PreviewType::PREVIEW_NONE {
@@ -1379,13 +1397,13 @@ fn gen_img_maybe_progress(
                 time: f32,
                 data: *mut ::std::os::raw::c_void,
             ) {
-                unsafe {
+                let _ = catch_unwind(|| unsafe {
                     let sender = &*data.cast::<Option<Sender<Progress>>>();
 
                     if let Some(sender) = sender {
                         let _ = sender.send(Progress { step, steps, time });
                     }
-                }
+                });
             }
             let sender_ptr: *mut c_void = &mut sender as *mut _ as *mut c_void;
             sd_set_progress_callback(Some(progress_callback), sender_ptr);
