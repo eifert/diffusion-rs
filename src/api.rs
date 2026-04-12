@@ -84,6 +84,14 @@ pub struct Progress {
     time: f32,
 }
 
+#[allow(unused)]
+#[derive(Debug)]
+pub enum ExtProgress {
+    Progress(Progress),
+    Preview(RgbImage),
+    FinalImage(RgbImage),
+}
+
 #[non_exhaustive]
 #[derive(Error, Debug)]
 /// Error that can occurs while forwarding models
@@ -1181,24 +1189,36 @@ unsafe fn upscale(
     }
 }
 
+/// Generate an image and receive progress, preview images and final images
+/// via callback.
+/// Note: All images are exclusively delivered in-memory via the callback, and the file output specified in the config is ignored when using this function.
+pub fn gen_img_with_ext_progress(
+    config: &Config,
+    model_config: &mut ModelConfig,
+    sender: Sender<ExtProgress>,
+) -> Result<(), DiffusionError> {
+    gen_img_maybe_progress(config, model_config, None, Some(sender))
+}
+
 /// Generate an image and receive update via queue
 pub fn gen_img_with_progress(
     config: &Config,
     model_config: &mut ModelConfig,
     sender: Sender<Progress>,
 ) -> Result<(), DiffusionError> {
-    gen_img_maybe_progress(config, model_config, Some(sender))
+    gen_img_maybe_progress(config, model_config, Some(sender), None)
 }
 
 /// Generate an image
 pub fn gen_img(config: &Config, model_config: &mut ModelConfig) -> Result<(), DiffusionError> {
-    gen_img_maybe_progress(config, model_config, None)
+    gen_img_maybe_progress(config, model_config, None, None)
 }
 
 fn gen_img_maybe_progress(
     config: &Config,
     model_config: &mut ModelConfig,
     mut sender: Option<Sender<Progress>>,
+    mut ext_sender: Option<Sender<ExtProgress>>,
 ) -> Result<(), DiffusionError> {
     let prompt: CLibString = CLibString::from(config.prompt.as_str());
     let files = output_files(&config.output, config.batch_count);
@@ -1377,17 +1397,53 @@ fn gen_img_maybe_progress(
             });
         }
 
-        if config.preview_mode != PreviewType::PREVIEW_NONE {
-            let data = &config.preview_output as *const PathBuf;
+        unsafe extern "C" fn send_preview_local(
+            _step: ::std::os::raw::c_int,
+            _frame_count: ::std::os::raw::c_int,
+            frames: *mut sd_image_t,
+            _is_noisy: bool,
+            data: *mut ::std::os::raw::c_void,
+        ) {
+            let _ = catch_unwind(|| unsafe {
+                let sender = &*data.cast::<Option<Sender<ExtProgress>>>();
+                let Some(sender) = sender else {
+                    return;
+                };
+                let img = *frames;
 
-            sd_set_preview_callback(
-                Some(save_preview_local),
-                config.preview_mode,
-                config.preview_interval,
-                !config.preview_noisy,
-                config.preview_noisy,
-                data as *mut c_void,
-            );
+                let len = (img.width * img.height * img.channel) as usize;
+                let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+                let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
+                    .map(|img| RgbImage::from(img))
+                    .and_then(|img| sender.send(ExtProgress::Preview(img)).ok());
+            });
+        }
+
+        if config.preview_mode != PreviewType::PREVIEW_NONE {
+            match ext_sender {
+                Some(ref sender) => {
+                    sd_set_preview_callback(
+                        Some(send_preview_local),
+                        config.preview_mode,
+                        config.preview_interval,
+                        !config.preview_noisy,
+                        config.preview_noisy,
+                        &mut ext_sender as *mut _ as *mut c_void,
+                    );
+                }
+                None => {
+                    let data = &config.preview_output as *const PathBuf;
+
+                    sd_set_preview_callback(
+                        Some(save_preview_local),
+                        config.preview_mode,
+                        config.preview_interval,
+                        !config.preview_noisy,
+                        config.preview_noisy,
+                        data as *mut c_void,
+                    );
+                }
+            }
         }
 
         if sender.is_some() {
@@ -1407,6 +1463,23 @@ fn gen_img_maybe_progress(
             }
             let sender_ptr: *mut c_void = &mut sender as *mut _ as *mut c_void;
             sd_set_progress_callback(Some(progress_callback), sender_ptr);
+        } else if ext_sender.is_some() {
+            unsafe extern "C" fn ext_progress_callback(
+                step: ::std::os::raw::c_int,
+                steps: ::std::os::raw::c_int,
+                time: f32,
+                data: *mut ::std::os::raw::c_void,
+            ) {
+                let _ = catch_unwind(|| unsafe {
+                    let sender = &*data.cast::<Option<Sender<ExtProgress>>>();
+
+                    if let Some(sender) = sender {
+                        let _ = sender.send(ExtProgress::Progress(Progress { step, steps, time }));
+                    }
+                });
+            }
+            let sender_ptr: *mut c_void = &mut ext_sender as *mut _ as *mut c_void;
+            sd_set_progress_callback(Some(ext_progress_callback), sender_ptr);
         }
 
         let loras: Vec<sd_lora_t> = model_config
@@ -1476,19 +1549,45 @@ fn gen_img_maybe_progress(
             if slice.is_null() {
                 return Err(DiffusionError::Forward);
             }
-            for (img, path) in slice::from_raw_parts(slice, config.batch_count as usize)
-                .iter()
-                .zip(files)
-            {
-                // img.data will be null on OOM or other generation errors,
-                // in which case we skip saving and just return an error
-                if img.data.is_null() {
-                    return Err(DiffusionError::Forward);
+            let image_slices = slice::from_raw_parts(slice, config.batch_count as usize);
+            if ext_sender.is_some() {
+                for img in image_slices.iter() {
+                    // img.data will be null on OOM or other generation errors,
+                    // in which case we skip sending the preview and just return an error
+                    if img.data.is_null() {
+                        return Err(DiffusionError::Forward);
+                    }
+                    match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
+                        Ok(img) => {
+                            let len = (img.width * img.height * img.channel) as usize;
+                            let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+                            let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
+                                .map(|img| RgbImage::from(img))
+                                .and_then(|img| {
+                                    ext_sender
+                                        .as_ref()
+                                        .unwrap()
+                                        .send(ExtProgress::FinalImage(img))
+                                        .ok()
+                                });
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
                 }
-                match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
-                    Ok(img) => save_img(img, &path, Some(&params_str))?,
-                    Err(err) => {
-                        return Err(err);
+            } else {
+                for (img, path) in image_slices.iter().zip(files) {
+                    // img.data will be null on OOM or other generation errors,
+                    // in which case we skip saving and just return an error
+                    if img.data.is_null() {
+                        return Err(DiffusionError::Forward);
+                    }
+                    match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
+                        Ok(img) => save_img(img, &path, Some(&params_str))?,
+                        Err(err) => {
+                            return Err(err);
+                        }
                     }
                 }
             }
