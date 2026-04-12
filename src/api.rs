@@ -79,9 +79,9 @@ static VALID_EXT: [&str; 3] = ["gguf", "safetensors", "pt"];
 #[derive(Debug)]
 /// Progress message returned fron [gen_img_with_progress]
 pub struct Progress {
-    step: i32,
-    steps: i32,
-    time: f32,
+    pub step: i32,
+    pub steps: i32,
+    pub time: f32,
 }
 
 #[allow(unused)]
