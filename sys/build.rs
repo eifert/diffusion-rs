@@ -135,6 +135,8 @@ fn main() {
         config.generator("Ninja");
         config.define("CMAKE_C_COMPILER", "clang");
         config.define("CMAKE_CXX_COMPILER", "clang++");
+        config.define("CMAKE_C_FLAGS", "-Wignore=unknown-argument");
+        config.define("CMAKE_CXX_FLAGS", "-Wignore=unknown-argument");
         config.define("CMAKE_BUILD_WITH_INSTALL_RPATH", "ON");
         config.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
         let hip_lib_path = if target.contains("msvc") {
