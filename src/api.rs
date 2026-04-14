@@ -1242,8 +1242,9 @@ fn gen_img_maybe_progress(
         let _guard = ScopeGuard;
         let has_init_image = config.init_img.exists();
         let has_mask_image = config.mask_img.exists();
+        let has_ref_images = !config.ref_images.is_empty();
 
-        let is_decode_only = !has_init_image;
+        let is_decode_only = !has_init_image && !has_ref_images;
         let sd_ctx = model_config.diffusion_ctx(is_decode_only);
         let upscaler_ctx = model_config.upscaler_ctx();
 
