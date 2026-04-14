@@ -1534,7 +1534,7 @@ fn gen_img_maybe_progress(
             control_strength: config.control_strength,
             pm_params,
             vae_tiling_params,
-            auto_resize_ref_image: config.disable_auto_resize_ref_image,
+            auto_resize_ref_image: !config.disable_auto_resize_ref_image,
             cache,
             loras: loras.as_ptr(),
             lora_count: loras.len() as u32,
