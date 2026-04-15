@@ -126,6 +126,58 @@ pub enum ClipSkip {
     OneLayer = 2,
 }
 
+#[derive(Debug, Clone)]
+/// Image source used by generation configs
+pub enum InputImage {
+    Path(PathBuf),
+    Image(RgbImage),
+}
+
+impl Default for InputImage {
+    fn default() -> Self {
+        Self::Path(PathBuf::new())
+    }
+}
+
+impl From<PathBuf> for InputImage {
+    fn from(value: PathBuf) -> Self {
+        Self::Path(value)
+    }
+}
+
+impl From<&Path> for InputImage {
+    fn from(value: &Path) -> Self {
+        Self::Path(value.to_path_buf())
+    }
+}
+
+impl From<&str> for InputImage {
+    fn from(value: &str) -> Self {
+        Self::Path(PathBuf::from(value))
+    }
+}
+
+impl From<String> for InputImage {
+    fn from(value: String) -> Self {
+        Self::Path(PathBuf::from(value))
+    }
+}
+
+impl From<RgbImage> for InputImage {
+    fn from(value: RgbImage) -> Self {
+        Self::Image(value)
+    }
+}
+
+impl InputImage {
+    fn is_present(&self) -> bool {
+        match self {
+            Self::Path(path) => !path.as_os_str().is_empty(),
+            Self::Image(_) => true,
+        }
+    }
+}
+
 type EmbeddingsStorage = (PathBuf, Vec<(CLibString, CLibPath)>, Vec<sd_embedding_t>);
 type LoraStorage = Vec<(CLibPath, LoraSpec)>;
 
@@ -830,19 +882,19 @@ pub struct Config {
 
     /// Path to the input image, required by img2img
     #[builder(default = "Default::default()")]
-    init_img: PathBuf,
+    init_img: InputImage,
 
     /// Path to the image used as a mask for img2img
     #[builder(default = "Default::default()")]
-    mask_img: PathBuf,
+    mask_img: InputImage,
 
     /// Path to image condition, control net
     #[builder(default = "Default::default()")]
     control_image: CLibPath,
 
     /// Paths to reference images for in-context conditioning (e.g. for Flux2)
-    #[builder(default = "Default::default()")]
-    ref_images: Vec<PathBuf>,
+    #[builder(default = "Default::default()", setter(custom))]
+    ref_images: Vec<InputImage>,
 
     /// Path to write result image to (default: ./output.png)
     #[builder(default = "PathBuf::from(\"./output.png\")")]
@@ -965,15 +1017,15 @@ pub struct Config {
 pub struct VideoConfig {
     /// Path to the input image, used as a starting frame
     #[builder(default = "Default::default()")]
-    init_img: PathBuf,
+    init_img: InputImage,
 
     /// Path to the ending image, required by some video models
     #[builder(default = "Default::default()")]
-    end_img: PathBuf,
+    end_img: InputImage,
 
     /// Paths to control video frames
-    #[builder(default = "Default::default()")]
-    control_frames: Vec<PathBuf>,
+    #[builder(default = "Default::default()", setter(custom))]
+    control_frames: Vec<InputImage>,
 
     /// Preview method
     #[builder(default = "PreviewType::PREVIEW_NONE")]
@@ -1158,6 +1210,14 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn ref_images<I>(&mut self, ref_images: Vec<I>) -> &mut Self
+    where
+        I: Into<InputImage>,
+    {
+        self.ref_images = Some(ref_images.into_iter().map(Into::into).collect());
+        self
+    }
+
     pub fn spectrum_caching(&mut self, params: SpectrumCacheParams) -> &mut Self {
         let (mut cache, mask) = Self::cache_init();
         cache.mode = sd_cache_mode_t::SD_CACHE_SPECTRUM;
@@ -1249,20 +1309,28 @@ impl VideoConfigBuilder {
             ("init_img", self.init_img.as_ref()),
             ("end_img", self.end_img.as_ref()),
         ] {
-            if let Some(path) = maybe_path
-                && !path.as_os_str().is_empty()
+            if let Some(image) = maybe_path
+                && image.is_present()
             {
-                validate_readable_image(path, label)?;
+                validate_readable_image(image, label)?;
             }
         }
 
         if let Some(control_frames) = self.control_frames.as_ref() {
-            for path in control_frames {
-                validate_readable_image(path, "control_frames")?;
+            for image in control_frames {
+                validate_readable_image(image, "control_frames")?;
             }
         }
 
         Ok(())
+    }
+
+    pub fn control_frames<I>(&mut self, control_frames: Vec<I>) -> &mut Self
+    where
+        I: Into<InputImage>,
+    {
+        self.control_frames = Some(control_frames.into_iter().map(Into::into).collect());
+        self
     }
 
     pub fn no_caching(&mut self) -> &mut Self {
@@ -1478,22 +1546,31 @@ fn output_files(path: &Path, batch_size: i32) -> Vec<PathBuf> {
     }
 }
 
-fn validate_readable_image(path: &Path, label: &str) -> Result<(), ConfigBuilderError> {
-    if !path.exists() {
-        return Err(ConfigBuilderError::ValidationError(format!(
-            "{label} path does not exist: {}",
-            path.display()
-        )));
+fn validate_readable_image(image: &InputImage, label: &str) -> Result<(), ConfigBuilderError> {
+    if let InputImage::Path(path) = image {
+        if !path.exists() {
+            return Err(ConfigBuilderError::ValidationError(format!(
+                "{label} path does not exist: {}",
+                path.display()
+            )));
+        }
+
+        image::open(path).map_err(|err| {
+            ConfigBuilderError::ValidationError(format!(
+                "{label} path is not a readable image ({}): {err}",
+                path.display()
+            ))
+        })?;
     }
 
-    image::open(path).map_err(|err| {
-        ConfigBuilderError::ValidationError(format!(
-            "{label} path is not a readable image ({}): {err}",
-            path.display()
-        ))
-    })?;
-
     Ok(())
+}
+
+fn load_rgb_image(source: &InputImage) -> Result<RgbImage, DiffusionError> {
+    match source {
+        InputImage::Path(path) => Ok(image::open(path)?.to_rgb8()),
+        InputImage::Image(image) => Ok(image.clone()),
+    }
 }
 
 fn make_guidance(
@@ -1639,8 +1716,8 @@ fn gen_img_maybe_progress(
             }
         }
         let _guard = ScopeGuard;
-        let has_init_image = config.init_img.exists();
-        let has_mask_image = config.mask_img.exists();
+        let has_init_image = config.init_img.is_present();
+        let has_mask_image = config.mask_img.is_present();
         let has_ref_images = !config.ref_images.is_empty();
 
         let is_decode_only = !has_init_image && !has_ref_images;
@@ -1722,25 +1799,28 @@ fn gen_img_maybe_progress(
         let mut mask_buffer: Vec<u8> = Vec::new();
 
         if has_init_image {
-            let img = image::open(&config.init_img)?;
-            image_buffer = img.to_rgb8().into_raw();
+            let img = load_rgb_image(&config.init_img)?;
+            let (width, height) = img.dimensions();
+            image_buffer = img.into_raw();
 
             init_image = sd_image_t {
-                width: img.width(),
-                height: img.height(),
+                width,
+                height,
                 channel: 3,
                 data: image_buffer.as_mut_ptr(),
             }
         }
 
         if has_mask_image {
-            let img = image::open(&config.mask_img)?;
+            let img = load_rgb_image(&config.mask_img)?;
+            let (width, height) = img.dimensions();
             // Masks have to have single channel luminosity information only
-            mask_buffer = img.to_luma8().into_raw();
+            let gray = image::DynamicImage::ImageRgb8(img).to_luma8();
+            mask_buffer = gray.into_raw();
 
             mask_image = sd_image_t {
-                width: img.width(),
-                height: img.height(),
+                width,
+                height,
                 channel: 1,
                 data: mask_buffer.as_mut_ptr(),
             }
@@ -1763,20 +1843,19 @@ fn gen_img_maybe_progress(
 
         let mut ref_image_list = Vec::new();
         let mut ref_pixel_storage = Vec::new();
-        for ref_path in &config.ref_images {
-            if ref_path.exists() {
-                let img = image::open(ref_path)?;
-                let image_data = img.to_rgb8().into_raw();
+        for ref_image in &config.ref_images {
+            let img = load_rgb_image(ref_image)?;
+            let (width, height) = img.dimensions();
+            let image_data = img.into_raw();
 
-                ref_pixel_storage.push(image_data);
-                let storage_ref = ref_pixel_storage.last_mut().unwrap();
-                ref_image_list.push(sd_image_t {
-                    width: img.width(),
-                    height: img.height(),
-                    channel: 3,
-                    data: storage_ref.as_mut_ptr(),
-                });
-            }
+            ref_pixel_storage.push(image_data);
+            let storage_ref = ref_pixel_storage.last_mut().unwrap();
+            ref_image_list.push(sd_image_t {
+                width,
+                height,
+                channel: 3,
+                data: storage_ref.as_mut_ptr(),
+            });
         }
 
         let num_ref_images = ref_image_list.len();
@@ -2028,8 +2107,8 @@ fn gen_video_maybe_progress(
         }
         let _guard = ScopeGuard;
 
-        let has_init_image = config.init_img.exists();
-        let has_end_image = config.end_img.exists();
+        let has_init_image = config.init_img.is_present();
+        let has_end_image = config.end_img.is_present();
         let has_control_frames = !config.control_frames.is_empty();
 
         let is_decode_only = !(has_init_image || has_end_image || has_control_frames);
@@ -2125,11 +2204,12 @@ fn gen_video_maybe_progress(
         let mut control_frames: Vec<sd_image_t> = Vec::new();
 
         if has_init_image {
-            let img = image::open(&config.init_img)?;
-            let mut buffer = img.to_rgb8().into_raw();
+            let img = load_rgb_image(&config.init_img)?;
+            let (width, height) = img.dimensions();
+            let mut buffer = img.into_raw();
             init_image = sd_image_t {
-                width: img.width(),
-                height: img.height(),
+                width,
+                height,
                 channel: 3,
                 data: buffer.as_mut_ptr(),
             };
@@ -2137,25 +2217,27 @@ fn gen_video_maybe_progress(
         }
 
         if has_end_image {
-            let img = image::open(&config.end_img)?;
-            let mut buffer = img.to_rgb8().into_raw();
+            let img = load_rgb_image(&config.end_img)?;
+            let (width, height) = img.dimensions();
+            let mut buffer = img.into_raw();
             end_image = sd_image_t {
-                width: img.width(),
-                height: img.height(),
+                width,
+                height,
                 channel: 3,
                 data: buffer.as_mut_ptr(),
             };
             _end_buffer = Some(buffer);
         }
 
-        for control_path in &config.control_frames {
-            let img = image::open(control_path)?;
-            let frame = img.to_rgb8().into_raw();
+        for control_image in &config.control_frames {
+            let img = load_rgb_image(control_image)?;
+            let (width, height) = img.dimensions();
+            let frame = img.into_raw();
             control_frame_storage.push(frame);
             let storage_ref = control_frame_storage.last_mut().unwrap();
             control_frames.push(sd_image_t {
-                width: img.width(),
-                height: img.height(),
+                width,
+                height,
                 channel: 3,
                 data: storage_ref.as_mut_ptr(),
             });
@@ -2404,6 +2486,27 @@ mod tests {
 
         fs::remove_file(&control_path).unwrap();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_in_memory_image_sources_build() {
+        let image = ImageBuffer::from_pixel(2, 2, Rgb([255u8, 0, 0]));
+
+        let config = ConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .init_img(image.clone())
+            .mask_img(image.clone())
+            .ref_images(vec![image.clone()])
+            .build();
+        assert!(config.is_ok());
+
+        let video_config = VideoConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .init_img(image.clone())
+            .end_img(image.clone())
+            .control_frames(vec![image])
+            .build();
+        assert!(video_config.is_ok());
     }
 
     #[test]
