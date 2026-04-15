@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::c_char;
 use std::ffi::c_void;
-use std::panic::catch_unwind;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::null;
@@ -10,6 +11,7 @@ use std::ptr::null_mut;
 use std::slice;
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::Local;
 use derive_builder::Builder;
@@ -30,9 +32,11 @@ use diffusion_rs_sys::sd_hires_params_t;
 use diffusion_rs_sys::sd_image_t;
 use diffusion_rs_sys::sd_img_gen_params_t;
 use diffusion_rs_sys::sd_img_gen_params_to_str;
+use diffusion_rs_sys::sd_log_level_t;
 use diffusion_rs_sys::sd_lora_t;
 use diffusion_rs_sys::sd_pm_params_t;
 use diffusion_rs_sys::sd_sample_params_t;
+use diffusion_rs_sys::sd_set_log_callback;
 use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
 use diffusion_rs_sys::sd_slg_params_t;
@@ -77,7 +81,73 @@ pub use diffusion_rs_sys::lora_apply_mode_t as LoraModeType;
 /// Hires mode
 pub use diffusion_rs_sys::sd_hires_upscaler_t as Upscaler;
 
+/// Log level reported by stable-diffusion.cpp
+pub use diffusion_rs_sys::sd_log_level_t as LogLevel;
+
 static VALID_EXT: [&str; 3] = ["gguf", "safetensors", "pt"];
+type SdLogger = dyn Fn(LogLevel, &str) + Send + Sync + 'static;
+static SD_LOGGER: OnceLock<RwLock<Option<Arc<SdLogger>>>> = OnceLock::new();
+
+fn sd_logger() -> &'static RwLock<Option<Arc<SdLogger>>> {
+    SD_LOGGER.get_or_init(|| RwLock::new(None))
+}
+
+unsafe extern "C" fn sd_log_callback(
+    level: sd_log_level_t,
+    text: *const c_char,
+    _data: *mut c_void,
+) {
+    let logger = {
+        let guard = sd_logger().read().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    let Some(logger) = logger else {
+        return;
+    };
+
+    let message = unsafe {
+        if text.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(text).to_string_lossy())
+        }
+    };
+
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        logger(level, message.as_deref().unwrap_or(""))
+    }));
+}
+
+/// Install a process-global stable-diffusion.cpp logger callback.
+///
+/// The callback may be invoked from native worker threads and remains active
+/// until replaced or cleared with [clear_sd_logger].
+pub fn set_sd_logger<F>(logger: F)
+where
+    F: Fn(LogLevel, &str) + Send + Sync + 'static,
+{
+    {
+        let mut guard = sd_logger().write().unwrap();
+        *guard = Some(Arc::new(logger));
+    }
+
+    unsafe {
+        sd_set_log_callback(Some(sd_log_callback), null_mut());
+    }
+}
+
+/// Remove the process-global stable-diffusion.cpp logger callback.
+pub fn clear_sd_logger() {
+    {
+        let mut guard = sd_logger().write().unwrap();
+        *guard = None;
+    }
+
+    unsafe {
+        sd_set_log_callback(None, null_mut());
+    }
+}
 
 #[allow(unused)]
 #[derive(Debug)]
