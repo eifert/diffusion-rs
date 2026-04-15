@@ -13,9 +13,12 @@ use std::sync::mpsc::Sender;
 
 use chrono::Local;
 use derive_builder::Builder;
+use diffusion_rs_sys::free_sd_audio;
 use diffusion_rs_sys::free_upscaler_ctx;
 use diffusion_rs_sys::generate_image;
+use diffusion_rs_sys::generate_video;
 use diffusion_rs_sys::new_upscaler_ctx;
+use diffusion_rs_sys::sd_audio_t;
 use diffusion_rs_sys::sd_cache_mode_t;
 use diffusion_rs_sys::sd_cache_params_t;
 use diffusion_rs_sys::sd_ctx_params_t;
@@ -34,6 +37,7 @@ use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
 use diffusion_rs_sys::sd_slg_params_t;
 use diffusion_rs_sys::sd_tiling_params_t;
+use diffusion_rs_sys::sd_vid_gen_params_t;
 use diffusion_rs_sys::upscaler_ctx_t;
 use image::ImageBuffer;
 use image::ImageError;
@@ -89,7 +93,9 @@ pub struct Progress {
 pub enum ExtProgress {
     Progress(Progress),
     Preview(RgbImage),
+    PreviewFrames(Vec<RgbImage>),
     FinalImage(RgbImage),
+    FinalFrames(Vec<RgbImage>),
 }
 
 #[non_exhaustive]
@@ -104,6 +110,8 @@ pub enum DiffusionError {
     Io(#[from] std::io::Error),
     #[error("The underling upscaler model returned a NULL image")]
     Upscaler,
+    #[error(transparent)]
+    Utf8(#[from] std::ffi::IntoStringError),
 }
 
 #[repr(i32)]
@@ -645,6 +653,8 @@ impl ModelConfig {
                         self.diffusion_conv_direct,
                         self.n_threads,
                         self.upscale_tile_size,
+                        null(),
+                        null(),
                     );
                     self.upscaler_ctx = Some(upscaler);
                 }
@@ -676,7 +686,9 @@ impl ModelConfig {
                     high_noise_diffusion_model_path: self.high_noise_diffusion_model.as_ptr(),
                     t5xxl_path: self.t5xxl.as_ptr(),
                     diffusion_model_path: self.diffusion_model.as_ptr(),
+                    embeddings_connectors_path: null(),
                     vae_path: self.vae.as_ptr(),
+                    audio_vae_path: null(),
                     taesd_path: self.taesd.as_ptr(),
                     control_net_path: self.control_net.as_ptr(),
                     embeddings: self.embeddings.2.as_ptr(),
@@ -702,13 +714,15 @@ impl ModelConfig {
                     force_sdxl_vae_conv_scale: self.force_sdxl_vae_conv_scale,
                     tae_preview_only: self.taesd_preview_only,
                     lora_apply_mode: self.lora_apply_mode,
-                    tensor_type_rules: null_mut(),
+                    tensor_type_rules: null(),
                     sampler_rng_type: self.sampler_rng_type,
                     circular_x: self.circular || self.circular_x,
                     circular_y: self.circular || self.circular_y,
                     qwen_image_zero_cond_t: self.use_qwen_image_zero_cond_true,
                     enable_mmap: self.enable_mmap,
                     max_vram: self.max_vram,
+                    backend: null(),
+                    params_backend: null(),
                 };
                 let ctx = new_sd_ctx(&sd_ctx_params);
                 self.diffusion_ctx = Some((ctx, sd_ctx_params))
@@ -942,6 +956,152 @@ pub struct Config {
     cache: (sd_cache_params_t, Option<CLibString>),
 }
 
+#[derive(Builder, Debug, Clone)]
+#[builder(
+    setter(into, strip_option),
+    build_fn(error = "ConfigBuilderError", validate = "Self::validate")
+)]
+/// Config struct for in-memory video generation
+pub struct VideoConfig {
+    /// Path to the input image, used as a starting frame
+    #[builder(default = "Default::default()")]
+    init_img: PathBuf,
+
+    /// Path to the ending image, required by some video models
+    #[builder(default = "Default::default()")]
+    end_img: PathBuf,
+
+    /// Paths to control video frames
+    #[builder(default = "Default::default()")]
+    control_frames: Vec<PathBuf>,
+
+    /// Preview method
+    #[builder(default = "PreviewType::PREVIEW_NONE")]
+    preview_mode: PreviewType,
+
+    /// Enables previewing noisy inputs of the models rather than the denoised outputs
+    #[builder(default = "false")]
+    preview_noisy: bool,
+
+    /// Interval in denoising steps between consecutive preview updates
+    #[builder(default = "1")]
+    preview_interval: i32,
+
+    /// The prompt to render
+    prompt: String,
+
+    /// The negative prompt (default: "")
+    #[builder(default = "\"\".into()")]
+    negative_prompt: CLibString,
+
+    /// Unconditional guidance scale (default: 7.0)
+    #[builder(default = "7.0")]
+    cfg_scale: f32,
+
+    /// Distilled guidance scale for models with guidance input (default: 3.5)
+    #[builder(default = "3.5")]
+    guidance: f32,
+
+    /// Strength for noising/unnoising (default: 0.75)
+    #[builder(default = "0.75")]
+    strength: f32,
+
+    /// Image height, in pixel space (default: 512)
+    #[builder(default = "512")]
+    height: i32,
+
+    /// Image width, in pixel space (default: 512)
+    #[builder(default = "512")]
+    width: i32,
+
+    /// Sampling method for the main denoising phase
+    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
+    sampling_method: SampleMethod,
+
+    /// eta in DDIM, only for DDIM/TCD/res_multistep/res_2s (default: 0)
+    #[builder(default = "0.")]
+    eta: f32,
+
+    /// Number of sample steps (default: 20)
+    #[builder(default = "20")]
+    steps: i32,
+
+    /// RNG seed (default: -1, use random seed)
+    #[builder(default = "-1")]
+    seed: i64,
+
+    /// Number of frames requested from the backend (default: 6)
+    #[builder(default = "6")]
+    video_frames: i32,
+
+    /// Ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
+    #[builder(default = "ClipSkip::Unspecified")]
+    clip_skip: ClipSkip,
+
+    /// skip layer guidance (SLG) scale, only for DiT models: (default: 0)
+    #[builder(default = "0.")]
+    slg_scale: f32,
+
+    /// Layers to skip for SLG steps: (default: [7,8,9])
+    #[builder(default = "vec![7, 8, 9]")]
+    skip_layer: Vec<i32>,
+
+    /// SLG enabling point: (default: 0.01)
+    #[builder(default = "0.01")]
+    skip_layer_start: f32,
+
+    /// SLG disabling point: (default: 0.2)
+    #[builder(default = "0.2")]
+    skip_layer_end: f32,
+
+    /// Number of high-noise sample steps (default: -1)
+    #[builder(default = "-1")]
+    high_noise_steps: i32,
+
+    /// Sampling method for the high-noise phase
+    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
+    high_noise_sampling_method: SampleMethod,
+
+    /// eta for the high-noise phase
+    #[builder(default = "0.")]
+    high_noise_eta: f32,
+
+    /// Unconditional guidance scale for the high-noise phase (default: 7.0)
+    #[builder(default = "7.0")]
+    high_noise_cfg_scale: f32,
+
+    /// Distilled guidance scale for the high-noise phase (default: 3.5)
+    #[builder(default = "3.5")]
+    high_noise_guidance: f32,
+
+    /// skip layer guidance (SLG) scale for the high-noise phase
+    #[builder(default = "0.")]
+    high_noise_slg_scale: f32,
+
+    /// Layers to skip for high-noise SLG steps: (default: [7,8,9])
+    #[builder(default = "vec![7, 8, 9]")]
+    high_noise_skip_layer: Vec<i32>,
+
+    /// High-noise SLG enabling point: (default: 0.01)
+    #[builder(default = "0.01")]
+    high_noise_skip_layer_start: f32,
+
+    /// High-noise SLG disabling point: (default: 0.2)
+    #[builder(default = "0.2")]
+    high_noise_skip_layer_end: f32,
+
+    /// timestep boundary for Wan2.2 MoE model. (default: 0.875)
+    #[builder(default = "0.875")]
+    moe_boundary: f32,
+
+    /// Wan VACE strength (default: 1.0)
+    #[builder(default = "1.0")]
+    vace_strength: f32,
+
+    #[builder(default = "ConfigBuilder::cache_init()", private)]
+    cache: (sd_cache_params_t, Option<CLibString>),
+}
+
 impl ConfigBuilder {
     fn validate(&self) -> Result<(), ConfigBuilderError> {
         self.validate_output_dir()
@@ -1064,6 +1224,120 @@ impl ConfigBuilder {
     }
 }
 
+impl VideoConfigBuilder {
+    fn validate(&self) -> Result<(), ConfigBuilderError> {
+        self.validate_video_frames()?;
+        self.validate_image_paths()
+    }
+
+    fn validate_video_frames(&self) -> Result<(), ConfigBuilderError> {
+        if self
+            .video_frames
+            .as_ref()
+            .map_or(true, |frames| *frames > 0)
+        {
+            Ok(())
+        } else {
+            Err(ConfigBuilderError::ValidationError(
+                "video_frames must be greater than 0".to_owned(),
+            ))
+        }
+    }
+
+    fn validate_image_paths(&self) -> Result<(), ConfigBuilderError> {
+        for (label, maybe_path) in [
+            ("init_img", self.init_img.as_ref()),
+            ("end_img", self.end_img.as_ref()),
+        ] {
+            if let Some(path) = maybe_path
+                && !path.as_os_str().is_empty()
+            {
+                validate_readable_image(path, label)?;
+            }
+        }
+
+        if let Some(control_frames) = self.control_frames.as_ref() {
+            for path in control_frames {
+                validate_readable_image(path, "control_frames")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn no_caching(&mut self) -> &mut Self {
+        let mut cache = ConfigBuilder::cache_init();
+        cache.0.mode = sd_cache_mode_t::SD_CACHE_DISABLED;
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn spectrum_caching(&mut self, params: SpectrumCacheParams) -> &mut Self {
+        let (mut cache, mask) = ConfigBuilder::cache_init();
+        cache.mode = sd_cache_mode_t::SD_CACHE_SPECTRUM;
+        cache.spectrum_w = params.w;
+        cache.spectrum_m = params.m;
+        cache.spectrum_lam = params.lam;
+        cache.spectrum_window_size = params.window;
+        cache.spectrum_flex_window = params.flex;
+        cache.spectrum_warmup_steps = params.warmup;
+        cache.spectrum_stop_percent = params.stop;
+        self.cache = Some((cache, mask));
+        self
+    }
+
+    pub fn ucache_caching(&mut self, params: UCacheParams) -> &mut Self {
+        let (mut cache, mask) = ConfigBuilder::cache_init();
+        cache.mode = sd_cache_mode_t::SD_CACHE_UCACHE;
+        cache.reuse_threshold = params.threshold;
+        cache.start_percent = params.start;
+        cache.end_percent = params.end;
+        cache.error_decay_rate = params.decay;
+        cache.use_relative_threshold = params.relative;
+        cache.reset_error_on_compute = params.reset;
+        self.cache = Some((cache, mask));
+        self
+    }
+
+    pub fn easy_cache_caching(&mut self, params: EasyCacheParams) -> &mut Self {
+        let (mut cache, mask) = ConfigBuilder::cache_init();
+        cache.mode = sd_cache_mode_t::SD_CACHE_EASYCACHE;
+        cache.reuse_threshold = params.threshold;
+        cache.start_percent = params.start;
+        cache.end_percent = params.end;
+        self.cache = Some((cache, mask));
+        self
+    }
+
+    pub fn db_cache_caching(&mut self, params: DbCacheParams) -> &mut Self {
+        let (mut cache, _) = ConfigBuilder::cache_init();
+        cache.mode = sd_cache_mode_t::SD_CACHE_DBCACHE;
+        cache.Fn_compute_blocks = params.fn_blocks;
+        cache.Bn_compute_blocks = params.bn_blocks;
+        cache.residual_diff_threshold = params.threshold;
+        cache.max_warmup_steps = params.warmup;
+        cache.scm_policy_dynamic = match params.scm_policy_dynamic {
+            ScmPolicy::Static => false,
+            ScmPolicy::Dynamic => true,
+        };
+        self.cache = Some((cache, Some(params.scm_mask)));
+        self
+    }
+
+    pub fn taylor_seer_caching(&mut self) -> &mut Self {
+        let (mut cache, mask) = ConfigBuilder::cache_init();
+        cache.mode = sd_cache_mode_t::SD_CACHE_TAYLORSEER;
+        self.cache = Some((cache, mask));
+        self
+    }
+
+    pub fn cache_dit_caching(&mut self, params: DbCacheParams) -> &mut Self {
+        self.db_cache_caching(params).cache.as_mut().unwrap().0.mode =
+            sd_cache_mode_t::SD_CACHE_CACHE_DIT;
+        self
+    }
+}
+
 impl From<&Config> for ConfigBuilder {
     fn from(value: &Config) -> Self {
         let mut builder = ConfigBuilder::default();
@@ -1094,6 +1368,49 @@ impl From<&Config> for ConfigBuilder {
             .canny(value.canny)
             .disable_auto_resize_ref_image(value.disable_auto_resize_ref_image)
             .preview_output(value.preview_output.clone())
+            .preview_mode(value.preview_mode)
+            .preview_noisy(value.preview_noisy)
+            .preview_interval(value.preview_interval)
+            .cache(value.cache.clone());
+        builder
+    }
+}
+
+impl From<VideoConfig> for VideoConfigBuilder {
+    fn from(value: VideoConfig) -> Self {
+        let mut builder = VideoConfigBuilder::default();
+        builder
+            .init_img(value.init_img)
+            .end_img(value.end_img)
+            .control_frames(value.control_frames)
+            .prompt(value.prompt)
+            .negative_prompt(value.negative_prompt)
+            .cfg_scale(value.cfg_scale)
+            .guidance(value.guidance)
+            .strength(value.strength)
+            .height(value.height)
+            .width(value.width)
+            .sampling_method(value.sampling_method)
+            .eta(value.eta)
+            .steps(value.steps)
+            .seed(value.seed)
+            .video_frames(value.video_frames)
+            .clip_skip(value.clip_skip)
+            .slg_scale(value.slg_scale)
+            .skip_layer(value.skip_layer)
+            .skip_layer_start(value.skip_layer_start)
+            .skip_layer_end(value.skip_layer_end)
+            .high_noise_steps(value.high_noise_steps)
+            .high_noise_sampling_method(value.high_noise_sampling_method)
+            .high_noise_eta(value.high_noise_eta)
+            .high_noise_cfg_scale(value.high_noise_cfg_scale)
+            .high_noise_guidance(value.high_noise_guidance)
+            .high_noise_slg_scale(value.high_noise_slg_scale)
+            .high_noise_skip_layer(value.high_noise_skip_layer)
+            .high_noise_skip_layer_start(value.high_noise_skip_layer_start)
+            .high_noise_skip_layer_end(value.high_noise_skip_layer_end)
+            .moe_boundary(value.moe_boundary)
+            .vace_strength(value.vace_strength)
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
@@ -1161,6 +1478,65 @@ fn output_files(path: &Path, batch_size: i32) -> Vec<PathBuf> {
     }
 }
 
+fn validate_readable_image(path: &Path, label: &str) -> Result<(), ConfigBuilderError> {
+    if !path.exists() {
+        return Err(ConfigBuilderError::ValidationError(format!(
+            "{label} path does not exist: {}",
+            path.display()
+        )));
+    }
+
+    image::open(path).map_err(|err| {
+        ConfigBuilderError::ValidationError(format!(
+            "{label} path is not a readable image ({}): {err}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn make_guidance(
+    cfg_scale: f32,
+    guidance: f32,
+    slg_scale: f32,
+    layers: &mut [i32],
+    layer_start: f32,
+    layer_end: f32,
+) -> sd_guidance_params_t {
+    sd_guidance_params_t {
+        txt_cfg: cfg_scale,
+        img_cfg: cfg_scale,
+        distilled_guidance: guidance,
+        slg: sd_slg_params_t {
+            layers: layers.as_mut_ptr(),
+            layer_count: layers.len(),
+            layer_start,
+            layer_end,
+            scale: slg_scale,
+        },
+    }
+}
+
+fn image_from_sd_image(img: sd_image_t) -> Option<RgbImage> {
+    let len = (img.width * img.height * img.channel) as usize;
+    let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+    ImageBuffer::from_raw(img.width, img.height, buffer).map(RgbImage::from)
+}
+
+fn images_from_sd_frames(frames: *mut sd_image_t, frame_count: i32) -> Vec<RgbImage> {
+    if frames.is_null() || frame_count <= 0 {
+        return Vec::new();
+    }
+
+    unsafe { slice::from_raw_parts(frames, frame_count as usize) }
+        .iter()
+        .copied()
+        .filter(|img| !img.data.is_null())
+        .filter_map(image_from_sd_image)
+        .collect()
+}
+
 unsafe fn upscale(
     upscale_repeats: i32,
     upscaler_ctx: Option<*mut upscaler_ctx_t>,
@@ -1200,6 +1576,20 @@ pub fn gen_img_with_ext_progress(
     gen_img_maybe_progress(config, model_config, None, Some(sender))
 }
 
+/// Generate a video and stream previews/final frames in-memory.
+///
+/// Callers should expect `ExtProgress::PreviewFrames` preview events and a final
+/// `ExtProgress::FinalFrames` event. `stable-diffusion.cpp` may normalize the
+/// final frame count to `4n+1`, so the returned frame count can differ from the
+/// requested `video_frames`.
+pub fn gen_video_with_ext_progress(
+    config: &VideoConfig,
+    model_config: &mut ModelConfig,
+    sender: Sender<ExtProgress>,
+) -> Result<(), DiffusionError> {
+    gen_video_maybe_progress(config, model_config, None, Some(sender))
+}
+
 /// Generate an image and receive update via queue
 pub fn gen_img_with_progress(
     config: &Config,
@@ -1207,6 +1597,15 @@ pub fn gen_img_with_progress(
     sender: Sender<Progress>,
 ) -> Result<(), DiffusionError> {
     gen_img_maybe_progress(config, model_config, Some(sender), None)
+}
+
+/// Generate a video while only receiving step-based progress updates.
+pub fn gen_video_with_progress(
+    config: &VideoConfig,
+    model_config: &mut ModelConfig,
+    sender: Sender<Progress>,
+) -> Result<(), DiffusionError> {
+    gen_video_maybe_progress(config, model_config, Some(sender), None)
 }
 
 /// Generate an image
@@ -1303,11 +1702,13 @@ fn gen_img_maybe_progress(
         };
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
+            temporal_tiling: false,
             tile_size_x: model_config.vae_tile_size.0,
             tile_size_y: model_config.vae_tile_size.1,
             target_overlap: model_config.vae_tile_overlap,
             rel_size_x: model_config.vae_relative_tile_size.0,
             rel_size_y: model_config.vae_relative_tile_size.1,
+            extra_tiling_args: null(),
         };
         let pm_params = sd_pm_params_t {
             id_images: null_mut(),
@@ -1413,7 +1814,7 @@ fn gen_img_maybe_progress(
                 let img = *frames;
 
                 let len = (img.width * img.height * img.channel) as usize;
-                let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+                let buffer = slice::from_raw_parts(img.data, len).to_vec();
                 let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
                     .map(|img| RgbImage::from(img))
                     .and_then(|img| sender.send(ExtProgress::Preview(img)).ok());
@@ -1422,7 +1823,7 @@ fn gen_img_maybe_progress(
 
         if config.preview_mode != PreviewType::PREVIEW_NONE {
             match ext_sender {
-                Some(ref sender) => {
+                Some(_) => {
                     sd_set_preview_callback(
                         Some(send_preview_local),
                         config.preview_mode,
@@ -1513,6 +1914,8 @@ fn gen_img_maybe_progress(
             steps: model_config.hires_params.1.steps,
             denoising_strength: model_config.hires_params.1.denoising_strength,
             upscale_tile_size: model_config.hires_params.1.upscale_tile_size,
+            custom_sigmas: null_mut(),
+            custom_sigmas_count: 0,
         };
 
         let sd_img_gen_params = sd_img_gen_params_t {
@@ -1561,7 +1964,7 @@ fn gen_img_maybe_progress(
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
                         Ok(img) => {
                             let len = (img.width * img.height * img.channel) as usize;
-                            let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+                            let buffer = slice::from_raw_parts(img.data, len).to_vec();
                             let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
                                 .map(|img| RgbImage::from(img))
                                 .and_then(|img| {
@@ -1599,6 +2002,310 @@ fn gen_img_maybe_progress(
     }
 }
 
+fn gen_video_maybe_progress(
+    config: &VideoConfig,
+    model_config: &mut ModelConfig,
+    mut sender: Option<Sender<Progress>>,
+    mut ext_sender: Option<Sender<ExtProgress>>,
+) -> Result<(), DiffusionError> {
+    let prompt: CLibString = CLibString::from(config.prompt.as_str());
+    unsafe {
+        struct ScopeGuard;
+        impl Drop for ScopeGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    sd_set_progress_callback(None, null_mut());
+                    sd_set_preview_callback(
+                        None,
+                        PreviewType::PREVIEW_NONE,
+                        0,
+                        false,
+                        false,
+                        null_mut(),
+                    );
+                }
+            }
+        }
+        let _guard = ScopeGuard;
+
+        let has_init_image = config.init_img.exists();
+        let has_end_image = config.end_img.exists();
+        let has_control_frames = !config.control_frames.is_empty();
+
+        let is_decode_only = !(has_init_image || has_end_image || has_control_frames);
+        let sd_ctx = model_config.diffusion_ctx(is_decode_only);
+
+        let mut init_image = sd_image_t {
+            width: 0,
+            height: 0,
+            channel: 3,
+            data: null_mut(),
+        };
+        let mut end_image = sd_image_t {
+            width: 0,
+            height: 0,
+            channel: 3,
+            data: null_mut(),
+        };
+
+        let mut layers = config.skip_layer.clone();
+        let guidance = make_guidance(
+            config.cfg_scale,
+            config.guidance,
+            config.slg_scale,
+            &mut layers,
+            config.skip_layer_start,
+            config.skip_layer_end,
+        );
+        let mut high_noise_layers = config.high_noise_skip_layer.clone();
+        let high_noise_guidance = make_guidance(
+            config.high_noise_cfg_scale,
+            config.high_noise_guidance,
+            config.high_noise_slg_scale,
+            &mut high_noise_layers,
+            config.high_noise_skip_layer_start,
+            config.high_noise_skip_layer_end,
+        );
+
+        let sample_method = if config.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+            sd_get_default_sample_method(sd_ctx)
+        } else {
+            config.sampling_method
+        };
+        let high_noise_sample_method =
+            if config.high_noise_sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+                sd_get_default_sample_method(sd_ctx)
+            } else {
+                config.high_noise_sampling_method
+            };
+        let scheduler = if model_config.scheduler == Scheduler::SCHEDULER_COUNT {
+            sd_get_default_scheduler(sd_ctx, sample_method)
+        } else {
+            model_config.scheduler
+        };
+
+        let sample_params = sd_sample_params_t {
+            guidance,
+            sample_method,
+            sample_steps: config.steps,
+            eta: config.eta,
+            scheduler,
+            shifted_timestep: model_config.timestep_shift,
+            custom_sigmas: model_config.sigmas.as_mut_ptr(),
+            custom_sigmas_count: model_config.sigmas.len() as i32,
+            flow_shift: model_config.flow_shift,
+            extra_sample_args: model_config.extra_sample_params.as_ptr(),
+        };
+        let high_noise_sample_params = sd_sample_params_t {
+            guidance: high_noise_guidance,
+            sample_method: high_noise_sample_method,
+            sample_steps: config.high_noise_steps,
+            eta: config.high_noise_eta,
+            scheduler,
+            shifted_timestep: model_config.timestep_shift,
+            custom_sigmas: null_mut(),
+            custom_sigmas_count: 0,
+            flow_shift: model_config.flow_shift,
+            extra_sample_args: null(),
+        };
+        let vae_tiling_params = sd_tiling_params_t {
+            enabled: model_config.vae_tiling,
+            temporal_tiling: false,
+            tile_size_x: model_config.vae_tile_size.0,
+            tile_size_y: model_config.vae_tile_size.1,
+            target_overlap: model_config.vae_tile_overlap,
+            rel_size_x: model_config.vae_relative_tile_size.0,
+            rel_size_y: model_config.vae_relative_tile_size.1,
+            extra_tiling_args: null(),
+        };
+
+        let mut _init_buffer: Option<Vec<u8>> = None;
+        let mut _end_buffer: Option<Vec<u8>> = None;
+        let mut control_frame_storage: Vec<Vec<u8>> = Vec::new();
+        let mut control_frames: Vec<sd_image_t> = Vec::new();
+
+        if has_init_image {
+            let img = image::open(&config.init_img)?;
+            let mut buffer = img.to_rgb8().into_raw();
+            init_image = sd_image_t {
+                width: img.width(),
+                height: img.height(),
+                channel: 3,
+                data: buffer.as_mut_ptr(),
+            };
+            _init_buffer = Some(buffer);
+        }
+
+        if has_end_image {
+            let img = image::open(&config.end_img)?;
+            let mut buffer = img.to_rgb8().into_raw();
+            end_image = sd_image_t {
+                width: img.width(),
+                height: img.height(),
+                channel: 3,
+                data: buffer.as_mut_ptr(),
+            };
+            _end_buffer = Some(buffer);
+        }
+
+        for control_path in &config.control_frames {
+            let img = image::open(control_path)?;
+            let frame = img.to_rgb8().into_raw();
+            control_frame_storage.push(frame);
+            let storage_ref = control_frame_storage.last_mut().unwrap();
+            control_frames.push(sd_image_t {
+                width: img.width(),
+                height: img.height(),
+                channel: 3,
+                data: storage_ref.as_mut_ptr(),
+            });
+        }
+
+        if config.preview_mode != PreviewType::PREVIEW_NONE && ext_sender.is_some() {
+            unsafe extern "C" fn send_preview_frames(
+                _step: ::std::os::raw::c_int,
+                frame_count: ::std::os::raw::c_int,
+                frames: *mut sd_image_t,
+                _is_noisy: bool,
+                data: *mut ::std::os::raw::c_void,
+            ) {
+                let _ = catch_unwind(|| unsafe {
+                    let sender = &*data.cast::<Option<Sender<ExtProgress>>>();
+                    let Some(sender) = sender else {
+                        return;
+                    };
+                    let images = images_from_sd_frames(frames, frame_count);
+                    let _ = sender.send(ExtProgress::PreviewFrames(images));
+                });
+            }
+
+            sd_set_preview_callback(
+                Some(send_preview_frames),
+                config.preview_mode,
+                config.preview_interval,
+                !config.preview_noisy,
+                config.preview_noisy,
+                &mut ext_sender as *mut _ as *mut c_void,
+            );
+        }
+
+        if sender.is_some() {
+            unsafe extern "C" fn progress_callback(
+                step: ::std::os::raw::c_int,
+                steps: ::std::os::raw::c_int,
+                time: f32,
+                data: *mut ::std::os::raw::c_void,
+            ) {
+                let _ = catch_unwind(|| unsafe {
+                    let sender = &*data.cast::<Option<Sender<Progress>>>();
+
+                    if let Some(sender) = sender {
+                        let _ = sender.send(Progress { step, steps, time });
+                    }
+                });
+            }
+            let sender_ptr: *mut c_void = &mut sender as *mut _ as *mut c_void;
+            sd_set_progress_callback(Some(progress_callback), sender_ptr);
+        } else if ext_sender.is_some() {
+            unsafe extern "C" fn ext_progress_callback(
+                step: ::std::os::raw::c_int,
+                steps: ::std::os::raw::c_int,
+                time: f32,
+                data: *mut ::std::os::raw::c_void,
+            ) {
+                let _ = catch_unwind(|| unsafe {
+                    let sender = &*data.cast::<Option<Sender<ExtProgress>>>();
+
+                    if let Some(sender) = sender {
+                        let _ = sender.send(ExtProgress::Progress(Progress { step, steps, time }));
+                    }
+                });
+            }
+            let sender_ptr: *mut c_void = &mut ext_sender as *mut _ as *mut c_void;
+            sd_set_progress_callback(Some(ext_progress_callback), sender_ptr);
+        }
+
+        let loras: Vec<sd_lora_t> = model_config
+            .lora_models
+            .iter()
+            .map(|(c_path, spec)| sd_lora_t {
+                is_high_noise: spec.is_high_noise,
+                multiplier: spec.multiplier,
+                path: c_path.as_ptr(),
+            })
+            .collect();
+
+        let mut cache = config.cache.0;
+        if let Some(scm_mask) = &config.cache.1 {
+            cache.scm_mask = scm_mask.as_ptr();
+        }
+
+        let mut num_frames_out = 0;
+        let hires = sd_hires_params_t {
+            enabled: false,
+            upscaler: Upscaler::SD_HIRES_UPSCALER_NONE,
+            model_path: null(),
+            scale: 1.0,
+            target_width: 0,
+            target_height: 0,
+            steps: 0,
+            denoising_strength: 0.0,
+            upscale_tile_size: 0,
+            custom_sigmas: null_mut(),
+            custom_sigmas_count: 0,
+        };
+        let sd_vid_gen_params = sd_vid_gen_params_t {
+            loras: loras.as_ptr(),
+            lora_count: loras.len() as u32,
+            prompt: prompt.as_ptr(),
+            negative_prompt: config.negative_prompt.as_ptr(),
+            clip_skip: config.clip_skip as i32,
+            init_image,
+            end_image,
+            control_frames: control_frames.as_mut_ptr(),
+            control_frames_size: control_frames.len() as i32,
+            width: config.width,
+            height: config.height,
+            sample_params,
+            high_noise_sample_params,
+            moe_boundary: config.moe_boundary,
+            strength: config.strength,
+            seed: config.seed,
+            video_frames: config.video_frames,
+            fps: 0,
+            vace_strength: config.vace_strength,
+            vae_tiling_params,
+            cache,
+            hires,
+        };
+
+        let mut frames_out: *mut sd_image_t = null_mut();
+        let mut audio_out: *mut sd_audio_t = null_mut();
+        let success = generate_video(
+            sd_ctx,
+            &sd_vid_gen_params,
+            &mut frames_out,
+            &mut num_frames_out,
+            &mut audio_out,
+        );
+        let ret = {
+            if !success || frames_out.is_null() {
+                return Err(DiffusionError::Forward);
+            }
+            let final_frames = images_from_sd_frames(frames_out, num_frames_out);
+            if let Some(sender) = ext_sender.as_ref() {
+                let _ = sender.send(ExtProgress::FinalFrames(final_frames));
+            }
+            Ok(())
+        };
+        if !audio_out.is_null() {
+            free_sd_audio(audio_out);
+        }
+        free(frames_out as *mut c_void);
+        ret
+    }
+}
+
 fn save_img(img: sd_image_t, path: &Path, params: Option<&str>) -> Result<(), DiffusionError> {
     // Thx @wandbrandon
     let len = (img.width * img.height * img.channel) as usize;
@@ -1621,7 +2328,9 @@ fn save_img(img: sd_image_t, path: &Path, params: Option<&str>) -> Result<(), Di
 
 #[cfg(test)]
 mod tests {
-    use image::{DynamicImage, ImageBuffer, Rgba};
+    use diffusion_rs_sys::sd_image_t;
+    use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
+    use std::fs;
     use std::path::PathBuf;
 
     use crate::{
@@ -1629,7 +2338,7 @@ mod tests {
         util::download_file_hf_hub,
     };
 
-    use super::{ConfigBuilder, gen_img};
+    use super::{ConfigBuilder, VideoConfigBuilder, gen_img, images_from_sd_frames};
 
     #[test]
     fn test_required_args_txt2img() {
@@ -1664,6 +2373,62 @@ mod tests {
             .output(PathBuf::from("./"))
             .build()
             .unwrap();
+    }
+
+    #[test]
+    fn test_required_args_video() {
+        VideoConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            VideoConfigBuilder::default()
+                .prompt("a lovely cat driving a sport car")
+                .video_frames(0)
+                .build(),
+            Err(ConfigBuilderError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn test_video_control_frame_validation() {
+        let control_path = PathBuf::from("video_control_validation_test.png");
+        let frame = ImageBuffer::from_pixel(2, 2, Rgb([255u8, 0, 0]));
+        frame.save(&control_path).unwrap();
+
+        let result = VideoConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .control_frames(vec![control_path.clone()])
+            .build();
+
+        fs::remove_file(&control_path).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_images_from_sd_frames() {
+        let mut pixels_a = vec![255, 0, 0, 0, 255, 0];
+        let mut pixels_b = vec![0, 0, 255, 255, 255, 0];
+        let mut frames = vec![
+            sd_image_t {
+                width: 2,
+                height: 1,
+                channel: 3,
+                data: pixels_a.as_mut_ptr(),
+            },
+            sd_image_t {
+                width: 2,
+                height: 1,
+                channel: 3,
+                data: pixels_b.as_mut_ptr(),
+            },
+        ];
+
+        let images = images_from_sd_frames(frames.as_mut_ptr(), frames.len() as i32);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(images[1].get_pixel(1, 0).0, [255, 255, 0]);
     }
 
     #[ignore]
