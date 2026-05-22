@@ -398,6 +398,10 @@ pub struct HiresParams {
     /// highres fix second pass denoising strength (default: 0.7)
     #[builder(default = "0.7")]
     denoising_strength: f32,
+
+    /// Custom sigma values for the highres pass
+    #[builder(default = "Default::default()")]
+    custom_sigmas: Vec<f32>,
 }
 
 /// Config struct for a specific diffusion model
@@ -472,6 +476,10 @@ pub struct ModelConfig {
     #[builder(default = "Default::default()")]
     vae: CLibPath,
 
+    /// Path to audio vae
+    #[builder(default = "Default::default()")]
+    audio_vae: CLibPath,
+
     /// Path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)
     #[builder(default = "Default::default()")]
     taesd: CLibPath,
@@ -483,6 +491,10 @@ pub struct ModelConfig {
     /// Path to embeddings
     #[builder(default = "Default::default()", setter(custom))]
     embeddings: EmbeddingsStorage,
+
+    /// Path to embeddings connectors
+    #[builder(default = "Default::default()")]
+    embeddings_connectors: CLibPath,
 
     /// Path to PHOTOMAKER model
     #[builder(default = "Default::default()")]
@@ -519,6 +531,14 @@ pub struct ModelConfig {
     /// Tile overlap for vae tiling, in fraction of tile size (default: 0.5)
     #[builder(default = "0.5")]
     vae_tile_overlap: f32,
+
+    /// Enable temporal vae tiling
+    #[builder(default = "false")]
+    vae_temporal_tiling: bool,
+
+    /// Extra vae tiling arguments, in backend-specific string format
+    #[builder(default = "CLibString::default()")]
+    vae_extra_tiling_args: CLibString,
 
     /// RNG (default: CUDA)
     #[builder(default = "RngFunction::CUDA_RNG")]
@@ -635,6 +655,14 @@ pub struct ModelConfig {
     /// Extra parameters for sampling, currently used for SDXL sample params, in json string format
     #[builder(default = "CLibString::default()")]
     extra_sample_params: CLibString,
+
+    /// Backend name for model computation
+    #[builder(default = "CLibString::default()")]
+    backend: CLibString,
+
+    /// Backend name for parameter storage/loading
+    #[builder(default = "CLibString::default()")]
+    params_backend: CLibString,
 }
 
 impl ModelConfigBuilder {
@@ -775,8 +803,8 @@ impl ModelConfig {
                         self.diffusion_conv_direct,
                         self.n_threads,
                         self.upscale_tile_size,
-                        null(),
-                        null(),
+                        self.backend.as_optional_ptr(),
+                        self.params_backend.as_optional_ptr(),
                     );
                     self.upscaler_ctx = Some(upscaler);
                 }
@@ -808,9 +836,9 @@ impl ModelConfig {
                     high_noise_diffusion_model_path: self.high_noise_diffusion_model.as_ptr(),
                     t5xxl_path: self.t5xxl.as_ptr(),
                     diffusion_model_path: self.diffusion_model.as_ptr(),
-                    embeddings_connectors_path: null(),
+                    embeddings_connectors_path: self.embeddings_connectors.as_ptr(),
                     vae_path: self.vae.as_ptr(),
-                    audio_vae_path: null(),
+                    audio_vae_path: self.audio_vae.as_ptr(),
                     taesd_path: self.taesd.as_ptr(),
                     control_net_path: self.control_net.as_ptr(),
                     embeddings: self.embeddings.2.as_ptr(),
@@ -843,8 +871,8 @@ impl ModelConfig {
                     qwen_image_zero_cond_t: self.use_qwen_image_zero_cond_true,
                     enable_mmap: self.enable_mmap,
                     max_vram: self.max_vram,
-                    backend: null(),
-                    params_backend: null(),
+                    backend: self.backend.as_optional_ptr(),
+                    params_backend: self.params_backend.as_optional_ptr(),
                 };
                 let ctx = new_sd_ctx(&sd_ctx_params);
                 self.diffusion_ctx = Some((ctx, sd_ctx_params))
@@ -891,9 +919,11 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .clip_vision(value.clip_vision.clone())
             .t5xxl(value.t5xxl.clone())
             .vae(value.vae.clone())
+            .audio_vae(value.audio_vae.clone())
             .taesd(value.taesd.clone())
             .control_net(value.control_net.clone())
             .embeddings(&value.embeddings.0)
+            .embeddings_connectors(value.embeddings_connectors.clone())
             .photo_maker(value.photo_maker.clone())
             .pm_id_embed_path(value.pm_id_embed_path.clone())
             .weight_type(value.weight_type)
@@ -902,6 +932,8 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .vae_tile_size(value.vae_tile_size)
             .vae_relative_tile_size(value.vae_relative_tile_size)
             .vae_tile_overlap(value.vae_tile_overlap)
+            .vae_temporal_tiling(value.vae_temporal_tiling)
+            .vae_extra_tiling_args(value.vae_extra_tiling_args.clone())
             .rng(value.rng)
             .sampler_rng_type(value.rng)
             .scheduler(value.scheduler)
@@ -931,7 +963,9 @@ impl From<&ModelConfig> for ModelConfigBuilder {
                 value.hires_params.1.clone(),
                 hires_path.as_deref(),
             )
-            .extra_sample_params(value.extra_sample_params.clone());
+            .extra_sample_params(value.extra_sample_params.clone())
+            .backend(value.backend.clone())
+            .params_backend(value.params_backend.clone());
 
         builder.lora_models_internal(value.lora_models.clone());
 
@@ -1156,6 +1190,10 @@ pub struct VideoConfig {
     #[builder(default = "6")]
     video_frames: i32,
 
+    /// Output frames per second metadata/conditioning for video generation (default: 0)
+    #[builder(default = "0")]
+    fps: i32,
+
     /// Ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
     #[builder(default = "ClipSkip::Unspecified")]
     clip_skip: ClipSkip,
@@ -1188,6 +1226,10 @@ pub struct VideoConfig {
     #[builder(default = "0.")]
     high_noise_eta: f32,
 
+    /// Extra parameters for high-noise sampling, in backend-specific string format
+    #[builder(default = "CLibString::default()")]
+    high_noise_extra_sample_params: CLibString,
+
     /// Unconditional guidance scale for the high-noise phase (default: 7.0)
     #[builder(default = "7.0")]
     high_noise_cfg_scale: f32,
@@ -1219,6 +1261,10 @@ pub struct VideoConfig {
     /// Wan VACE strength (default: 1.0)
     #[builder(default = "1.0")]
     vace_strength: f32,
+
+    /// Video-specific hires fix parameters and upscaler model.
+    #[builder(default = "ModelConfigBuilder::hires_init()", setter(custom))]
+    hires_params: (Upscaler, HiresParams, Option<CLibPath>),
 
     #[builder(default = "ConfigBuilder::cache_init()", private)]
     cache: (sd_cache_params_t, Option<CLibString>),
@@ -1403,6 +1449,30 @@ impl VideoConfigBuilder {
         self
     }
 
+    pub fn hires_params(
+        &mut self,
+        upscaler: Upscaler,
+        params: HiresParams,
+        custom_model: Option<&Path>,
+    ) -> &mut Self {
+        if upscaler == Upscaler::SD_HIRES_UPSCALER_COUNT
+            || (upscaler == Upscaler::SD_HIRES_UPSCALER_MODEL && custom_model.is_none())
+        {
+            panic!("Invalid combination for {upscaler:?} and {custom_model:?}")
+        }
+        self.hires_params = Some((upscaler, params, custom_model.map(Into::into)));
+        self
+    }
+
+    pub fn video_hires_params(
+        &mut self,
+        upscaler: Upscaler,
+        params: HiresParams,
+        custom_model: Option<&Path>,
+    ) -> &mut Self {
+        self.hires_params(upscaler, params, custom_model)
+    }
+
     pub fn no_caching(&mut self) -> &mut Self {
         let mut cache = ConfigBuilder::cache_init();
         cache.0.mode = sd_cache_mode_t::SD_CACHE_DISABLED;
@@ -1517,6 +1587,7 @@ impl From<&Config> for ConfigBuilder {
 impl From<VideoConfig> for VideoConfigBuilder {
     fn from(value: VideoConfig) -> Self {
         let mut builder = VideoConfigBuilder::default();
+        let hires_path = value.hires_params.2.as_ref().map(PathBuf::from);
         builder
             .init_img(value.init_img)
             .end_img(value.end_img)
@@ -1533,6 +1604,7 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .steps(value.steps)
             .seed(value.seed)
             .video_frames(value.video_frames)
+            .fps(value.fps)
             .clip_skip(value.clip_skip)
             .slg_scale(value.slg_scale)
             .skip_layer(value.skip_layer)
@@ -1541,6 +1613,7 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .high_noise_steps(value.high_noise_steps)
             .high_noise_sampling_method(value.high_noise_sampling_method)
             .high_noise_eta(value.high_noise_eta)
+            .high_noise_extra_sample_params(value.high_noise_extra_sample_params)
             .high_noise_cfg_scale(value.high_noise_cfg_scale)
             .high_noise_guidance(value.high_noise_guidance)
             .high_noise_slg_scale(value.high_noise_slg_scale)
@@ -1552,6 +1625,11 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
+            .hires_params(
+                value.hires_params.0,
+                value.hires_params.1,
+                hires_path.as_deref(),
+            )
             .cache(value.cache.clone());
         builder
     }
@@ -1563,6 +1641,14 @@ struct CLibString(CString);
 impl CLibString {
     fn as_ptr(&self) -> *const c_char {
         self.0.as_ptr()
+    }
+
+    fn as_optional_ptr(&self) -> *const c_char {
+        if self.0.as_bytes().is_empty() {
+            null()
+        } else {
+            self.as_ptr()
+        }
     }
 }
 
@@ -1662,6 +1748,27 @@ fn make_guidance(
             layer_end,
             scale: slg_scale,
         },
+    }
+}
+
+fn make_hires_params(
+    upscaler: Upscaler,
+    params: &HiresParams,
+    custom_model: Option<&CLibPath>,
+    custom_sigmas: &mut Vec<f32>,
+) -> sd_hires_params_t {
+    sd_hires_params_t {
+        enabled: upscaler != Upscaler::SD_HIRES_UPSCALER_NONE,
+        upscaler,
+        model_path: custom_model.map_or(null(), CLibPath::as_ptr),
+        scale: params.scale,
+        target_width: params.width,
+        target_height: params.height,
+        steps: params.steps,
+        denoising_strength: params.denoising_strength,
+        upscale_tile_size: params.upscale_tile_size,
+        custom_sigmas: custom_sigmas.as_mut_ptr(),
+        custom_sigmas_count: custom_sigmas.len() as i32,
     }
 }
 
@@ -1839,7 +1946,7 @@ fn gen_img_maybe_progress(
             custom_sigmas: model_config.sigmas.as_mut_ptr(),
             custom_sigmas_count: model_config.sigmas.len() as i32,
             flow_shift: model_config.flow_shift,
-            extra_sample_args: model_config.extra_sample_params.as_ptr(),
+            extra_sample_args: model_config.extra_sample_params.as_optional_ptr(),
         };
         let control_image = sd_image_t {
             width: 0,
@@ -1849,13 +1956,13 @@ fn gen_img_maybe_progress(
         };
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
-            temporal_tiling: false,
+            temporal_tiling: model_config.vae_temporal_tiling,
             tile_size_x: model_config.vae_tile_size.0,
             tile_size_y: model_config.vae_tile_size.1,
             target_overlap: model_config.vae_tile_overlap,
             rel_size_x: model_config.vae_relative_tile_size.0,
             rel_size_y: model_config.vae_relative_tile_size.1,
-            extra_tiling_args: null(),
+            extra_tiling_args: model_config.vae_extra_tiling_args.as_optional_ptr(),
         };
         let pm_params = sd_pm_params_t {
             id_images: null_mut(),
@@ -2048,24 +2155,13 @@ fn gen_img_maybe_progress(
             cache.scm_mask = scm_mask.as_ptr();
         }
 
-        let mut hires_path = null();
-        if let Some(path) = &model_config.hires_params.2 {
-            hires_path = path.as_ptr();
-        }
-
-        let hires = sd_hires_params_t {
-            enabled: model_config.hires_params.0 != Upscaler::SD_HIRES_UPSCALER_NONE,
-            upscaler: model_config.hires_params.0,
-            model_path: hires_path,
-            scale: model_config.hires_params.1.scale,
-            target_width: model_config.hires_params.1.width,
-            target_height: model_config.hires_params.1.height,
-            steps: model_config.hires_params.1.steps,
-            denoising_strength: model_config.hires_params.1.denoising_strength,
-            upscale_tile_size: model_config.hires_params.1.upscale_tile_size,
-            custom_sigmas: null_mut(),
-            custom_sigmas_count: 0,
-        };
+        let mut hires_custom_sigmas = model_config.hires_params.1.custom_sigmas.clone();
+        let hires = make_hires_params(
+            model_config.hires_params.0,
+            &model_config.hires_params.1,
+            model_config.hires_params.2.as_ref(),
+            &mut hires_custom_sigmas,
+        );
 
         let sd_img_gen_params = sd_img_gen_params_t {
             prompt: prompt.as_ptr(),
@@ -2243,7 +2339,7 @@ fn gen_video_maybe_progress(
             custom_sigmas: model_config.sigmas.as_mut_ptr(),
             custom_sigmas_count: model_config.sigmas.len() as i32,
             flow_shift: model_config.flow_shift,
-            extra_sample_args: model_config.extra_sample_params.as_ptr(),
+            extra_sample_args: model_config.extra_sample_params.as_optional_ptr(),
         };
         let high_noise_sample_params = sd_sample_params_t {
             guidance: high_noise_guidance,
@@ -2255,17 +2351,17 @@ fn gen_video_maybe_progress(
             custom_sigmas: null_mut(),
             custom_sigmas_count: 0,
             flow_shift: model_config.flow_shift,
-            extra_sample_args: null(),
+            extra_sample_args: config.high_noise_extra_sample_params.as_optional_ptr(),
         };
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
-            temporal_tiling: false,
+            temporal_tiling: model_config.vae_temporal_tiling,
             tile_size_x: model_config.vae_tile_size.0,
             tile_size_y: model_config.vae_tile_size.1,
             target_overlap: model_config.vae_tile_overlap,
             rel_size_x: model_config.vae_relative_tile_size.0,
             rel_size_y: model_config.vae_relative_tile_size.1,
-            extra_tiling_args: null(),
+            extra_tiling_args: model_config.vae_extra_tiling_args.as_optional_ptr(),
         };
 
         let mut _init_buffer: Option<Vec<u8>> = None;
@@ -2393,19 +2489,13 @@ fn gen_video_maybe_progress(
         }
 
         let mut num_frames_out = 0;
-        let hires = sd_hires_params_t {
-            enabled: false,
-            upscaler: Upscaler::SD_HIRES_UPSCALER_NONE,
-            model_path: null(),
-            scale: 1.0,
-            target_width: 0,
-            target_height: 0,
-            steps: 0,
-            denoising_strength: 0.0,
-            upscale_tile_size: 0,
-            custom_sigmas: null_mut(),
-            custom_sigmas_count: 0,
-        };
+        let mut hires_custom_sigmas = config.hires_params.1.custom_sigmas.clone();
+        let hires = make_hires_params(
+            config.hires_params.0,
+            &config.hires_params.1,
+            config.hires_params.2.as_ref(),
+            &mut hires_custom_sigmas,
+        );
         let sd_vid_gen_params = sd_vid_gen_params_t {
             loras: loras.as_ptr(),
             lora_count: loras.len() as u32,
@@ -2424,7 +2514,7 @@ fn gen_video_maybe_progress(
             strength: config.strength,
             seed: config.seed,
             video_frames: config.video_frames,
-            fps: 0,
+            fps: config.fps,
             vace_strength: config.vace_strength,
             vae_tiling_params,
             cache,
@@ -2490,7 +2580,10 @@ mod tests {
         util::download_file_hf_hub,
     };
 
-    use super::{ConfigBuilder, VideoConfigBuilder, gen_img, images_from_sd_frames};
+    use super::{
+        ConfigBuilder, HiresParamsBuilder, Upscaler, VideoConfigBuilder, gen_img,
+        images_from_sd_frames,
+    };
 
     #[test]
     fn test_required_args_txt2img() {
@@ -2577,6 +2670,70 @@ mod tests {
             .control_frames(vec![image])
             .build();
         assert!(video_config.is_ok());
+    }
+
+    #[test]
+    fn test_new_api_params_build() {
+        let hires = HiresParamsBuilder::default()
+            .custom_sigmas(vec![1.0, 0.5])
+            .build()
+            .unwrap();
+
+        let model_config = ModelConfigBuilder::default()
+            .model(PathBuf::from("./test.ckpt"))
+            .audio_vae(PathBuf::from("./audio_vae.gguf"))
+            .embeddings_connectors(PathBuf::from("./connectors"))
+            .vae_temporal_tiling(true)
+            .vae_extra_tiling_args("{\"temporal\":true}")
+            .extra_sample_params("{\"sample\":true}")
+            .backend("cpu")
+            .params_backend("cpu")
+            .hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires.clone(), None)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            PathBuf::from(&model_config.audio_vae),
+            PathBuf::from("./audio_vae.gguf")
+        );
+        assert_eq!(
+            PathBuf::from(&model_config.embeddings_connectors),
+            PathBuf::from("./connectors")
+        );
+        assert!(model_config.vae_temporal_tiling);
+        assert_eq!(
+            model_config.vae_extra_tiling_args.0.to_str().unwrap(),
+            "{\"temporal\":true}"
+        );
+        assert_eq!(
+            model_config.extra_sample_params.0.to_str().unwrap(),
+            "{\"sample\":true}"
+        );
+        assert_eq!(model_config.backend.0.to_str().unwrap(), "cpu");
+        assert_eq!(model_config.params_backend.0.to_str().unwrap(), "cpu");
+        assert_eq!(model_config.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
+
+        let video_config = VideoConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .fps(24)
+            .high_noise_extra_sample_params("{\"high_noise\":true}")
+            .video_hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires, None)
+            .build()
+            .unwrap();
+        assert_eq!(video_config.fps, 24);
+        assert_eq!(
+            video_config
+                .high_noise_extra_sample_params
+                .0
+                .to_str()
+                .unwrap(),
+            "{\"high_noise\":true}"
+        );
+        assert_eq!(video_config.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
+
+        let rebuilt = VideoConfigBuilder::from(video_config).build().unwrap();
+        assert_eq!(rebuilt.fps, 24);
+        assert_eq!(rebuilt.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
     }
 
     #[test]
