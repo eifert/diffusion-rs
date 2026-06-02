@@ -159,6 +159,15 @@ pub struct Progress {
 }
 
 #[allow(unused)]
+#[derive(Debug, Clone, PartialEq)]
+/// Owned PCM audio buffer returned by video generation progress events.
+pub struct AudioBuffer {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub samples: Vec<f32>,
+}
+
+#[allow(unused)]
 #[derive(Debug)]
 pub enum ExtProgress {
     Progress(Progress),
@@ -166,6 +175,7 @@ pub enum ExtProgress {
     PreviewFrames(Vec<RgbImage>),
     FinalImage(RgbImage),
     FinalFrames(Vec<RgbImage>),
+    FinalFramesWithAudio(Vec<RgbImage>, AudioBuffer),
 }
 
 #[non_exhaustive]
@@ -1791,6 +1801,35 @@ fn images_from_sd_frames(frames: *mut sd_image_t, frame_count: i32) -> Vec<RgbIm
         .collect()
 }
 
+fn audio_from_sd_audio(audio: *const sd_audio_t) -> Option<AudioBuffer> {
+    if audio.is_null() {
+        return None;
+    }
+
+    let audio = unsafe { &*audio };
+    if audio.data.is_null() || audio.sample_count == 0 || audio.channels == 0 {
+        return None;
+    }
+
+    let sample_count = usize::try_from(audio.sample_count).ok()?;
+    let channels = usize::try_from(audio.channels).ok()?;
+    let len = sample_count.checked_mul(channels)?;
+    let samples = unsafe { slice::from_raw_parts(audio.data, len).to_vec() };
+
+    Some(AudioBuffer {
+        sample_rate: audio.sample_rate,
+        channels: audio.channels,
+        samples,
+    })
+}
+
+fn final_video_progress(final_frames: Vec<RgbImage>, audio: *const sd_audio_t) -> ExtProgress {
+    match audio_from_sd_audio(audio) {
+        Some(audio) => ExtProgress::FinalFramesWithAudio(final_frames, audio),
+        None => ExtProgress::FinalFrames(final_frames),
+    }
+}
+
 unsafe fn upscale(
     upscale_repeats: i32,
     upscaler_ctx: Option<*mut upscaler_ctx_t>,
@@ -1833,9 +1872,9 @@ pub fn gen_img_with_ext_progress(
 /// Generate a video and stream previews/final frames in-memory.
 ///
 /// Callers should expect `ExtProgress::PreviewFrames` preview events and a final
-/// `ExtProgress::FinalFrames` event. `stable-diffusion.cpp` may normalize the
-/// final frame count to `4n+1`, so the returned frame count can differ from the
-/// requested `video_frames`.
+/// `ExtProgress::FinalFrames` or `ExtProgress::FinalFramesWithAudio` event.
+/// `stable-diffusion.cpp` may normalize the final frame count to `4n+1`, so the
+/// returned frame count can differ from the requested `video_frames`.
 pub fn gen_video_with_ext_progress(
     config: &VideoConfig,
     model_config: &mut ModelConfig,
@@ -2536,7 +2575,7 @@ fn gen_video_maybe_progress(
             }
             let final_frames = images_from_sd_frames(frames_out, num_frames_out);
             if let Some(sender) = ext_sender.as_ref() {
-                let _ = sender.send(ExtProgress::FinalFrames(final_frames));
+                let _ = sender.send(final_video_progress(final_frames, audio_out));
             }
             Ok(())
         };
@@ -2570,10 +2609,11 @@ fn save_img(img: sd_image_t, path: &Path, params: Option<&str>) -> Result<(), Di
 
 #[cfg(test)]
 mod tests {
-    use diffusion_rs_sys::sd_image_t;
+    use diffusion_rs_sys::{sd_audio_t, sd_image_t};
     use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
     use std::fs;
     use std::path::PathBuf;
+    use std::ptr::null;
 
     use crate::{
         api::{ConfigBuilderError, ModelConfigBuilder},
@@ -2581,8 +2621,8 @@ mod tests {
     };
 
     use super::{
-        ConfigBuilder, HiresParamsBuilder, Upscaler, VideoConfigBuilder, gen_img,
-        images_from_sd_frames,
+        AudioBuffer, ConfigBuilder, ExtProgress, HiresParamsBuilder, Upscaler, VideoConfigBuilder,
+        audio_from_sd_audio, final_video_progress, gen_img, images_from_sd_frames,
     };
 
     #[test]
@@ -2759,6 +2799,65 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].get_pixel(0, 0).0, [255, 0, 0]);
         assert_eq!(images[1].get_pixel(1, 0).0, [255, 255, 0]);
+    }
+
+    #[test]
+    fn test_audio_from_sd_audio() {
+        let mut samples = vec![0.25, -0.25, 0.5, -0.5];
+        let audio = sd_audio_t {
+            sample_rate: 44_100,
+            channels: 2,
+            sample_count: 2,
+            data: samples.as_mut_ptr(),
+        };
+
+        let owned = audio_from_sd_audio(&audio).unwrap();
+        assert_eq!(
+            owned,
+            AudioBuffer {
+                sample_rate: 44_100,
+                channels: 2,
+                samples,
+            }
+        );
+    }
+
+    #[test]
+    fn test_final_video_progress_without_audio() {
+        let frame = ImageBuffer::from_pixel(1, 1, Rgb([10u8, 20, 30]));
+
+        match final_video_progress(vec![frame], null()) {
+            ExtProgress::FinalFrames(frames) => {
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].get_pixel(0, 0).0, [10, 20, 30]);
+            }
+            other => panic!("expected FinalFrames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_final_video_progress_with_audio() {
+        let frame_a = ImageBuffer::from_pixel(1, 1, Rgb([1u8, 2, 3]));
+        let frame_b = ImageBuffer::from_pixel(1, 1, Rgb([4u8, 5, 6]));
+        let mut samples = vec![0.1, 0.2, 0.3, 0.4];
+        let audio = sd_audio_t {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_count: 2,
+            data: samples.as_mut_ptr(),
+        };
+
+        match final_video_progress(vec![frame_a, frame_b], &audio) {
+            ExtProgress::FinalFramesWithAudio(frames, audio) => {
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0].get_pixel(0, 0).0, [1, 2, 3]);
+                assert_eq!(frames[1].get_pixel(0, 0).0, [4, 5, 6]);
+                assert_eq!(audio.sample_rate, 48_000);
+                assert_eq!(audio.channels, 2);
+                assert_eq!(audio.samples, samples);
+            }
+            other => panic!("expected FinalFramesWithAudio, got {other:?}"),
+        }
     }
 
     #[ignore]
