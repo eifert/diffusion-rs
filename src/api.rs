@@ -41,6 +41,7 @@ use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
 use diffusion_rs_sys::sd_slg_params_t;
 use diffusion_rs_sys::sd_tiling_params_t;
+use diffusion_rs_sys::sd_vae_format_t;
 use diffusion_rs_sys::sd_vid_gen_params_t;
 use diffusion_rs_sys::upscaler_ctx_t;
 use image::ImageBuffer;
@@ -438,6 +439,10 @@ pub struct ModelConfig {
     #[builder(default = "-1.0")]
     max_vram: f32,
 
+    /// Enable layer streaming when max_vram is used
+    #[builder(default = "false")]
+    stream_layers: bool,
+
     /// Path to esrgan model. Upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now
     #[builder(default = "Default::default()")]
     upscale_model: Option<CLibPath>,
@@ -549,6 +554,10 @@ pub struct ModelConfig {
     /// Extra vae tiling arguments, in backend-specific string format
     #[builder(default = "CLibString::default()")]
     vae_extra_tiling_args: CLibString,
+
+    /// Preferred VAE format hint (default: auto)
+    #[builder(default = "sd_vae_format_t::SD_VAE_FORMAT_AUTO")]
+    vae_format: sd_vae_format_t,
 
     /// RNG (default: CUDA)
     #[builder(default = "RngFunction::CUDA_RNG")]
@@ -881,6 +890,8 @@ impl ModelConfig {
                     qwen_image_zero_cond_t: self.use_qwen_image_zero_cond_true,
                     enable_mmap: self.enable_mmap,
                     max_vram: self.max_vram,
+                    stream_layers: self.stream_layers,
+                    vae_format: self.vae_format,
                     backend: self.backend.as_optional_ptr(),
                     params_backend: self.params_backend.as_optional_ptr(),
                 };
@@ -944,6 +955,7 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .vae_tile_overlap(value.vae_tile_overlap)
             .vae_temporal_tiling(value.vae_temporal_tiling)
             .vae_extra_tiling_args(value.vae_extra_tiling_args.clone())
+            .vae_format(value.vae_format)
             .rng(value.rng)
             .sampler_rng_type(value.rng)
             .scheduler(value.scheduler)
