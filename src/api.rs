@@ -24,6 +24,8 @@ use diffusion_rs_sys::sd_audio_t;
 use diffusion_rs_sys::sd_cache_mode_t;
 use diffusion_rs_sys::sd_cache_params_t;
 use diffusion_rs_sys::sd_ctx_params_t;
+use diffusion_rs_sys::sd_ctx_supports_image_generation;
+use diffusion_rs_sys::sd_ctx_supports_video_generation;
 use diffusion_rs_sys::sd_embedding_t;
 use diffusion_rs_sys::sd_get_default_sample_method;
 use diffusion_rs_sys::sd_get_default_scheduler;
@@ -810,6 +812,34 @@ impl ModelConfigBuilder {
 }
 
 impl ModelConfig {
+    /// Returns whether the configured context supports image generation.
+    ///
+    /// This lazily initializes the diffusion context if needed.
+    pub fn supports_image_generation(&mut self) -> bool {
+        unsafe {
+            let vae_decode_only = self
+                .diffusion_ctx
+                .as_ref()
+                .map_or(true, |(_, params)| params.vae_decode_only);
+            let ctx = self.diffusion_ctx(vae_decode_only);
+            sd_ctx_supports_image_generation(ctx)
+        }
+    }
+
+    /// Returns whether the configured context supports video generation.
+    ///
+    /// This lazily initializes the diffusion context if needed.
+    pub fn supports_video_generation(&mut self) -> bool {
+        unsafe {
+            let vae_decode_only = self
+                .diffusion_ctx
+                .as_ref()
+                .map_or(true, |(_, params)| params.vae_decode_only);
+            let ctx = self.diffusion_ctx(vae_decode_only);
+            sd_ctx_supports_video_generation(ctx)
+        }
+    }
+
     unsafe fn upscaler_ctx(&mut self) -> Option<*mut upscaler_ctx_t> {
         unsafe {
             if self.upscale_model.is_none() || self.upscale_repeats == 0 {
