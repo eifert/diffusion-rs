@@ -465,6 +465,10 @@ pub struct ModelConfig {
     #[builder(default = "Default::default()")]
     diffusion_model: CLibPath,
 
+    /// Path to the unconditional diffusion model
+    #[builder(default = "Default::default()")]
+    uncond_diffusion_model: CLibPath,
+
     /// Path to the qwen2vl text encoder
     #[builder(default = "Default::default()")]
     llm: CLibPath,
@@ -885,6 +889,7 @@ impl ModelConfig {
                     high_noise_diffusion_model_path: self.high_noise_diffusion_model.as_ptr(),
                     t5xxl_path: self.t5xxl.as_ptr(),
                     diffusion_model_path: self.diffusion_model.as_ptr(),
+                    uncond_diffusion_model_path: self.uncond_diffusion_model.as_ptr(),
                     embeddings_connectors_path: self.embeddings_connectors.as_ptr(),
                     vae_path: self.vae.as_ptr(),
                     audio_vae_path: self.audio_vae.as_ptr(),
