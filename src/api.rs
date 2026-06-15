@@ -1057,13 +1057,13 @@ pub struct Config {
     #[builder(default = "Default::default()", setter(custom))]
     ref_images: Vec<InputImage>,
 
-    /// Path to write result image to (default: ./output.png)
-    #[builder(default = "PathBuf::from(\"./output.png\")")]
-    output: PathBuf,
+    /// Optional path to write result image to
+    #[builder(default = "None")]
+    output: Option<PathBuf>,
 
-    /// Path to write result image to (default: ./output.png)
-    #[builder(default = "PathBuf::from(\"./preview_output.png\")")]
-    preview_output: PathBuf,
+    /// Optional path to write preview image updates to
+    #[builder(default = "None")]
+    preview_output: Option<PathBuf>,
 
     /// Preview method
     #[builder(default = "PreviewType::PREVIEW_NONE")]
@@ -1333,7 +1333,10 @@ impl ConfigBuilder {
     }
 
     fn validate_output_dir(&self) -> Result<(), ConfigBuilderError> {
-        let is_dir = self.output.as_ref().is_some_and(|val| val.is_dir());
+        let Some(output) = self.output.as_ref().and_then(|output| output.as_ref()) else {
+            return Ok(());
+        };
+        let is_dir = output.is_dir();
         let multiple_items = self.batch_count.as_ref().is_some_and(|val| *val > 1);
         if is_dir == multiple_items {
             Ok(())
@@ -1612,7 +1615,6 @@ impl From<&Config> for ConfigBuilder {
             .mask_img(value.mask_img.clone())
             .control_image(value.control_image.clone())
             .ref_images(value.ref_images.clone())
-            .output(value.output.clone())
             .prompt(value.prompt.clone())
             .negative_prompt(value.negative_prompt.clone())
             .cfg_scale(value.cfg_scale)
@@ -1632,11 +1634,16 @@ impl From<&Config> for ConfigBuilder {
             .skip_layer_end(value.skip_layer_end)
             .canny(value.canny)
             .disable_auto_resize_ref_image(value.disable_auto_resize_ref_image)
-            .preview_output(value.preview_output.clone())
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
             .cache(value.cache.clone());
+        if let Some(output) = &value.output {
+            builder.output(output.clone());
+        }
+        if let Some(preview_output) = &value.preview_output {
+            builder.preview_output(preview_output.clone());
+        }
         builder
     }
 }
@@ -1748,7 +1755,10 @@ impl From<&CLibPath> for PathBuf {
     }
 }
 
-fn output_files(path: &Path, batch_size: i32) -> Vec<PathBuf> {
+fn output_files(path: Option<&Path>, batch_size: i32) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
     let date = Local::now().format("%Y.%m.%d-%H.%M.%S");
     if batch_size == 1 {
         vec![path.into()]
@@ -1960,7 +1970,7 @@ fn gen_img_maybe_progress(
     mut ext_sender: Option<Sender<ExtProgress>>,
 ) -> Result<(), DiffusionError> {
     let prompt: CLibString = CLibString::from(config.prompt.as_str());
-    let files = output_files(&config.output, config.batch_count);
+    let files = output_files(config.output.as_deref(), config.batch_count);
     unsafe {
         struct ScopeGuard;
         impl Drop for ScopeGuard {
@@ -2136,14 +2146,16 @@ fn gen_img_maybe_progress(
             data: *mut ::std::os::raw::c_void,
         ) {
             let _ = catch_unwind(|| unsafe {
-                let path = &*data.cast::<PathBuf>();
-                let _ = save_img(*frames, path, None);
+                let path = &*data.cast::<Option<PathBuf>>();
+                if let Some(path) = path {
+                    let _ = save_img(*frames, path, None);
+                }
             });
         }
 
         unsafe extern "C" fn send_preview_local(
             _step: ::std::os::raw::c_int,
-            _frame_count: ::std::os::raw::c_int,
+            frame_count: ::std::os::raw::c_int,
             frames: *mut sd_image_t,
             _is_noisy: bool,
             data: *mut ::std::os::raw::c_void,
@@ -2153,13 +2165,8 @@ fn gen_img_maybe_progress(
                 let Some(sender) = sender else {
                     return;
                 };
-                let img = *frames;
-
-                let len = (img.width * img.height * img.channel) as usize;
-                let buffer = slice::from_raw_parts(img.data, len).to_vec();
-                let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
-                    .map(|img| RgbImage::from(img))
-                    .and_then(|img| sender.send(ExtProgress::Preview(img)).ok());
+                let images = images_from_sd_frames(frames, frame_count);
+                let _ = sender.send(ExtProgress::PreviewFrames(images));
             });
         }
 
@@ -2176,16 +2183,18 @@ fn gen_img_maybe_progress(
                     );
                 }
                 None => {
-                    let data = &config.preview_output as *const PathBuf;
+                    if config.preview_output.is_some() {
+                        let data = &config.preview_output as *const Option<PathBuf>;
 
-                    sd_set_preview_callback(
-                        Some(save_preview_local),
-                        config.preview_mode,
-                        config.preview_interval,
-                        !config.preview_noisy,
-                        config.preview_noisy,
-                        data as *mut c_void,
-                    );
+                        sd_set_preview_callback(
+                            Some(save_preview_local),
+                            config.preview_mode,
+                            config.preview_interval,
+                            !config.preview_noisy,
+                            config.preview_noisy,
+                            data as *mut c_void,
+                        );
+                    }
                 }
             }
         }
@@ -2690,9 +2699,16 @@ mod tests {
             ConfigBuilder::default()
                 .prompt("a lovely cat driving a sport car")
                 .batch_count(10)
+                .output(PathBuf::from("./output.png"))
                 .build(),
             Err(ConfigBuilderError::ValidationError(_))
         ));
+
+        ConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .batch_count(10)
+            .build()
+            .unwrap();
 
         ConfigBuilder::default()
             .prompt("a lovely cat driving a sport car")
