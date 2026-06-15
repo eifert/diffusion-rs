@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use chrono::Local;
 use derive_builder::Builder;
 use diffusion_rs_sys::free_sd_audio;
+use diffusion_rs_sys::free_sd_images;
 use diffusion_rs_sys::free_upscaler_ctx;
 use diffusion_rs_sys::generate_image;
 use diffusion_rs_sys::generate_video;
@@ -55,7 +56,6 @@ use diffusion_rs_sys::upscaler_ctx_t;
 use image::ImageBuffer;
 use image::ImageError;
 use image::RgbImage;
-use libc::free;
 use little_exif::exif_tag::ExifTag;
 use little_exif::metadata::Metadata;
 use thiserror::Error;
@@ -2075,7 +2075,7 @@ unsafe fn upscale(
                         return Err(DiffusionError::Upscaler);
                     }
 
-                    free(current_image.data as *mut c_void);
+                    free_sd_images(&mut current_image, 1);
                     current_image = upscaled_image;
                 }
                 Ok(current_image)
@@ -2522,7 +2522,7 @@ fn gen_img_maybe_progress(
             }
             Ok(())
         };
-        free(slice as *mut c_void);
+        free_sd_images(slice, config.batch_count);
         ret
     }
 }
@@ -2825,7 +2825,7 @@ fn gen_video_maybe_progress(
         if !audio_out.is_null() {
             free_sd_audio(audio_out);
         }
-        free(frames_out as *mut c_void);
+        free_sd_images(frames_out, num_frames_out);
         ret
     }
 }
