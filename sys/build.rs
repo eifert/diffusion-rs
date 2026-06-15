@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::{create_dir_all, read_dir},
+    fs::{create_dir_all, read_dir, remove_dir_all},
     path::{Path, PathBuf},
 };
 
@@ -17,21 +17,30 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=stable-diffusion.cpp/.git");
+    println!("cargo:rerun-if-changed=stable-diffusion.cpp/include/stable-diffusion.h");
 
     // Copy stable-diffusion code into the build script directory
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let diffusion_root = out.join("stable-diffusion.cpp/");
 
-    if !diffusion_root.exists() {
-        create_dir_all(&diffusion_root).unwrap();
-        dir::copy("./stable-diffusion.cpp", &out, &Default::default()).unwrap_or_else(|e| {
+    if diffusion_root.exists() {
+        remove_dir_all(&diffusion_root).unwrap_or_else(|e| {
             panic!(
-                "Failed to copy stable-diffusion sources into {}: {}",
+                "Failed to remove stale stable-diffusion sources from {}: {}",
                 diffusion_root.display(),
                 e
             )
         });
     }
+    create_dir_all(&diffusion_root).unwrap();
+    dir::copy("./stable-diffusion.cpp", &out, &Default::default()).unwrap_or_else(|e| {
+        panic!(
+            "Failed to copy stable-diffusion sources into {}: {}",
+            diffusion_root.display(),
+            e
+        )
+    });
 
     // Bindgen
     let bindings = bindgen::Builder::default()

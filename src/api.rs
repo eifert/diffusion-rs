@@ -10,8 +10,9 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use std::slice;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::Local;
 use derive_builder::Builder;
@@ -23,6 +24,9 @@ use diffusion_rs_sys::new_upscaler_ctx;
 use diffusion_rs_sys::sd_audio_t;
 use diffusion_rs_sys::sd_cache_mode_t;
 use diffusion_rs_sys::sd_cache_params_t;
+use diffusion_rs_sys::sd_cancel_generation;
+use diffusion_rs_sys::sd_cancel_mode_t;
+use diffusion_rs_sys::sd_ctx_params_init;
 use diffusion_rs_sys::sd_ctx_params_t;
 use diffusion_rs_sys::sd_ctx_supports_image_generation;
 use diffusion_rs_sys::sd_ctx_supports_video_generation;
@@ -32,11 +36,13 @@ use diffusion_rs_sys::sd_get_default_scheduler;
 use diffusion_rs_sys::sd_guidance_params_t;
 use diffusion_rs_sys::sd_hires_params_t;
 use diffusion_rs_sys::sd_image_t;
+use diffusion_rs_sys::sd_img_gen_params_init;
 use diffusion_rs_sys::sd_img_gen_params_t;
 use diffusion_rs_sys::sd_img_gen_params_to_str;
 use diffusion_rs_sys::sd_log_level_t;
 use diffusion_rs_sys::sd_lora_t;
 use diffusion_rs_sys::sd_pm_params_t;
+use diffusion_rs_sys::sd_pulid_params_t;
 use diffusion_rs_sys::sd_sample_params_t;
 use diffusion_rs_sys::sd_set_log_callback;
 use diffusion_rs_sys::sd_set_preview_callback;
@@ -93,6 +99,114 @@ static SD_LOGGER: OnceLock<RwLock<Option<Arc<SdLogger>>>> = OnceLock::new();
 
 fn sd_logger() -> &'static RwLock<Option<Arc<SdLogger>>> {
     SD_LOGGER.get_or_init(|| RwLock::new(None))
+}
+
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+/// Cancellation mode for an active generation.
+pub enum GenerationCancelMode {
+    /// Stop the current generation as soon as possible.
+    All = sd_cancel_mode_t::SD_CANCEL_ALL as i32,
+    /// Finish the current image sample, then skip remaining batch latents.
+    NewLatents = sd_cancel_mode_t::SD_CANCEL_NEW_LATENTS as i32,
+    /// Clear a pending cancellation request.
+    Reset = sd_cancel_mode_t::SD_CANCEL_RESET as i32,
+}
+
+impl From<GenerationCancelMode> for sd_cancel_mode_t {
+    fn from(value: GenerationCancelMode) -> Self {
+        match value {
+            GenerationCancelMode::All => sd_cancel_mode_t::SD_CANCEL_ALL,
+            GenerationCancelMode::NewLatents => sd_cancel_mode_t::SD_CANCEL_NEW_LATENTS,
+            GenerationCancelMode::Reset => sd_cancel_mode_t::SD_CANCEL_RESET,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GenerationCancelState {
+    ctx: Mutex<usize>,
+    mode: AtomicI32,
+}
+
+impl Default for GenerationCancelState {
+    fn default() -> Self {
+        Self {
+            ctx: Mutex::new(0),
+            mode: AtomicI32::new(GenerationCancelMode::Reset as i32),
+        }
+    }
+}
+
+impl GenerationCancelState {
+    fn attach(&self, ctx: *mut sd_ctx_t) {
+        *self.ctx.lock().unwrap() = ctx as usize;
+    }
+
+    unsafe fn free_attached(&self, ctx: *mut sd_ctx_t) {
+        let mut guard = self.ctx.lock().unwrap();
+        if *guard == ctx as usize {
+            *guard = 0;
+        }
+        unsafe {
+            free_sd_ctx(ctx);
+        }
+    }
+
+    fn set_mode(&self, mode: GenerationCancelMode) -> bool {
+        let guard = self.ctx.lock().unwrap();
+        let ctx = *guard as *mut sd_ctx_t;
+        if ctx.is_null() {
+            return false;
+        }
+        self.mode.store(mode as i32, Ordering::SeqCst);
+        unsafe {
+            sd_cancel_generation(ctx, mode.into());
+        }
+        true
+    }
+
+    fn reset(&self) -> bool {
+        self.set_mode(GenerationCancelMode::Reset)
+    }
+
+    fn mode(&self) -> GenerationCancelMode {
+        match self.mode.load(Ordering::SeqCst) {
+            value if value == GenerationCancelMode::All as i32 => GenerationCancelMode::All,
+            value if value == GenerationCancelMode::NewLatents as i32 => {
+                GenerationCancelMode::NewLatents
+            }
+            _ => GenerationCancelMode::Reset,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Cloneable handle that can cancel an active generation from another thread.
+pub struct GenerationCancelHandle {
+    state: Arc<GenerationCancelState>,
+}
+
+impl GenerationCancelHandle {
+    /// Stop the current generation as soon as possible.
+    pub fn cancel(&self) -> bool {
+        self.set_mode(GenerationCancelMode::All)
+    }
+
+    /// Finish the current image sample, then skip remaining batch latents.
+    pub fn cancel_new_latents(&self) -> bool {
+        self.set_mode(GenerationCancelMode::NewLatents)
+    }
+
+    /// Clear a pending cancellation request.
+    pub fn reset(&self) -> bool {
+        self.set_mode(GenerationCancelMode::Reset)
+    }
+
+    /// Forward a cancellation mode to the active native context.
+    pub fn set_mode(&self, mode: GenerationCancelMode) -> bool {
+        self.state.set_mode(mode)
+    }
 }
 
 unsafe extern "C" fn sd_log_callback(
@@ -187,6 +301,8 @@ pub enum ExtProgress {
 pub enum DiffusionError {
     #[error("The underling stablediffusion.cpp function returned NULL")]
     Forward,
+    #[error("Generation was cancelled")]
+    Cancelled,
     #[error(transparent)]
     StoreImages(#[from] ImageError),
     #[error(transparent)]
@@ -441,6 +557,10 @@ pub struct ModelConfig {
     #[builder(default = "-1.0")]
     max_vram: f32,
 
+    /// Maximum VRAM assignment spec, overriding max_vram when set
+    #[builder(default = "CLibString::default()")]
+    max_vram_spec: CLibString,
+
     /// Enable layer streaming when max_vram is used
     #[builder(default = "false")]
     stream_layers: bool,
@@ -520,6 +640,10 @@ pub struct ModelConfig {
     /// Path to PHOTOMAKER model
     #[builder(default = "Default::default()")]
     photo_maker: CLibPath,
+
+    /// Path to PuLID Flux weights
+    #[builder(default = "Default::default()")]
+    pulid_weights: CLibPath,
 
     /// Path to PHOTOMAKER v2 id embed
     #[builder(default = "Default::default()")]
@@ -671,7 +795,10 @@ pub struct ModelConfig {
     upscaler_ctx: Option<*mut upscaler_ctx_t>,
 
     #[builder(default = "None", private)]
-    diffusion_ctx: Option<(*mut sd_ctx_t, sd_ctx_params_t)>,
+    diffusion_ctx: Option<*mut sd_ctx_t>,
+
+    #[builder(default = "Arc::new(GenerationCancelState::default())", private)]
+    cancel_state: Arc<GenerationCancelState>,
 
     /// Hires fix parameters and upscaler model.
     #[builder(default = "Self::hires_init()", setter(custom))]
@@ -688,6 +815,10 @@ pub struct ModelConfig {
     /// Backend name for parameter storage/loading
     #[builder(default = "CLibString::default()")]
     params_backend: CLibString,
+
+    /// Comma-separated RPC server list
+    #[builder(default = "CLibString::default()")]
+    rpc_servers: CLibString,
 }
 
 impl ModelConfigBuilder {
@@ -816,16 +947,19 @@ impl ModelConfigBuilder {
 }
 
 impl ModelConfig {
+    /// Returns a cloneable handle that can cancel an active generation.
+    pub fn cancel_handle(&self) -> GenerationCancelHandle {
+        GenerationCancelHandle {
+            state: Arc::clone(&self.cancel_state),
+        }
+    }
+
     /// Returns whether the configured context supports image generation.
     ///
     /// This lazily initializes the diffusion context if needed.
     pub fn supports_image_generation(&mut self) -> bool {
         unsafe {
-            let vae_decode_only = self
-                .diffusion_ctx
-                .as_ref()
-                .map_or(true, |(_, params)| params.vae_decode_only);
-            let ctx = self.diffusion_ctx(vae_decode_only);
+            let ctx = self.diffusion_ctx();
             sd_ctx_supports_image_generation(ctx)
         }
     }
@@ -835,11 +969,7 @@ impl ModelConfig {
     /// This lazily initializes the diffusion context if needed.
     pub fn supports_video_generation(&mut self) -> bool {
         unsafe {
-            let vae_decode_only = self
-                .diffusion_ctx
-                .as_ref()
-                .map_or(true, |(_, params)| params.vae_decode_only);
-            let ctx = self.diffusion_ctx(vae_decode_only);
+            let ctx = self.diffusion_ctx();
             sd_ctx_supports_video_generation(ctx)
         }
     }
@@ -852,7 +982,6 @@ impl ModelConfig {
                 if self.upscaler_ctx.is_none() {
                     let upscaler = new_upscaler_ctx(
                         self.upscale_model.as_ref().unwrap().as_ptr(),
-                        self.offload_params_to_cpu,
                         self.diffusion_conv_direct,
                         self.n_threads,
                         self.upscale_tile_size,
@@ -866,74 +995,83 @@ impl ModelConfig {
         }
     }
 
-    unsafe fn diffusion_ctx(&mut self, vae_decode_only: bool) -> *mut sd_ctx_t {
+    unsafe fn diffusion_ctx(&mut self) -> *mut sd_ctx_t {
         unsafe {
-            // This is required to support img2img after text2img generation
-            // otherwise the context is cached and won't have a decode graph
-            // leading to an assertion error in sdcpp
-            if let Some((sd_ctx, sd_ctx_params)) = self.diffusion_ctx.as_ref()
-                && sd_ctx_params.vae_decode_only != vae_decode_only
-            {
-                sd_set_progress_callback(None, null_mut());
-                free_sd_ctx(*sd_ctx);
-                self.diffusion_ctx = None;
-            }
             if self.diffusion_ctx.is_none() {
-                let sd_ctx_params = sd_ctx_params_t {
-                    model_path: self.model.as_ptr(),
-                    llm_path: self.llm.as_ptr(),
-                    llm_vision_path: self.llm_vision.as_ptr(),
-                    clip_l_path: self.clip_l.as_ptr(),
-                    clip_g_path: self.clip_g.as_ptr(),
-                    clip_vision_path: self.clip_vision.as_ptr(),
-                    high_noise_diffusion_model_path: self.high_noise_diffusion_model.as_ptr(),
-                    t5xxl_path: self.t5xxl.as_ptr(),
-                    diffusion_model_path: self.diffusion_model.as_ptr(),
-                    uncond_diffusion_model_path: self.uncond_diffusion_model.as_ptr(),
-                    embeddings_connectors_path: self.embeddings_connectors.as_ptr(),
-                    vae_path: self.vae.as_ptr(),
-                    audio_vae_path: self.audio_vae.as_ptr(),
-                    taesd_path: self.taesd.as_ptr(),
-                    control_net_path: self.control_net.as_ptr(),
-                    embeddings: self.embeddings.2.as_ptr(),
-                    embedding_count: self.embeddings.1.len() as u32,
-                    photo_maker_path: self.photo_maker.as_ptr(),
-                    vae_decode_only,
-                    free_params_immediately: false,
-                    n_threads: self.n_threads,
-                    wtype: self.weight_type,
-                    rng_type: self.rng,
-                    keep_clip_on_cpu: self.clip_on_cpu,
-                    keep_control_net_on_cpu: self.control_net_cpu,
-                    keep_vae_on_cpu: self.vae_on_cpu,
-                    diffusion_flash_attn: self.diffusion_flash_attention,
-                    flash_attn: self.flash_attention,
-                    diffusion_conv_direct: self.diffusion_conv_direct,
-                    chroma_use_dit_mask: !self.chroma_disable_dit_mask,
-                    chroma_use_t5_mask: self.chroma_enable_t5_mask,
-                    chroma_t5_mask_pad: self.chroma_t5_mask_pad,
-                    vae_conv_direct: self.vae_conv_direct,
-                    offload_params_to_cpu: self.offload_params_to_cpu,
-                    prediction: self.prediction,
-                    force_sdxl_vae_conv_scale: self.force_sdxl_vae_conv_scale,
-                    tae_preview_only: self.taesd_preview_only,
-                    lora_apply_mode: self.lora_apply_mode,
-                    tensor_type_rules: null(),
-                    sampler_rng_type: self.sampler_rng_type,
-                    circular_x: self.circular || self.circular_x,
-                    circular_y: self.circular || self.circular_y,
-                    qwen_image_zero_cond_t: self.use_qwen_image_zero_cond_true,
-                    enable_mmap: self.enable_mmap,
-                    max_vram: self.max_vram,
-                    stream_layers: self.stream_layers,
-                    vae_format: self.vae_format,
-                    backend: self.backend.as_optional_ptr(),
-                    params_backend: self.params_backend.as_optional_ptr(),
+                let runtime_assignments: Vec<&str> = [
+                    (self.clip_on_cpu, "te=cpu"),
+                    (self.vae_on_cpu, "vae=cpu"),
+                    (self.control_net_cpu, "controlnet=cpu"),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, assignment)| enabled.then_some(assignment))
+                .collect();
+                let params_assignments: Vec<&str> = self
+                    .offload_params_to_cpu
+                    .then_some("*=cpu")
+                    .into_iter()
+                    .collect();
+                let backend = prepend_backend_assignment(&self.backend, &runtime_assignments);
+                let params_backend =
+                    prepend_backend_assignment(&self.params_backend, &params_assignments);
+                let max_vram = if self.max_vram_spec.is_empty() {
+                    CLibString::from(self.max_vram.to_string())
+                } else {
+                    self.max_vram_spec.clone()
                 };
+                let mut sd_ctx_params: sd_ctx_params_t = std::mem::zeroed();
+                sd_ctx_params_init(&mut sd_ctx_params);
+                sd_ctx_params.model_path = self.model.as_ptr();
+                sd_ctx_params.llm_path = self.llm.as_ptr();
+                sd_ctx_params.llm_vision_path = self.llm_vision.as_ptr();
+                sd_ctx_params.clip_l_path = self.clip_l.as_ptr();
+                sd_ctx_params.clip_g_path = self.clip_g.as_ptr();
+                sd_ctx_params.clip_vision_path = self.clip_vision.as_ptr();
+                sd_ctx_params.high_noise_diffusion_model_path =
+                    self.high_noise_diffusion_model.as_ptr();
+                sd_ctx_params.t5xxl_path = self.t5xxl.as_ptr();
+                sd_ctx_params.diffusion_model_path = self.diffusion_model.as_ptr();
+                sd_ctx_params.uncond_diffusion_model_path = self.uncond_diffusion_model.as_ptr();
+                sd_ctx_params.embeddings_connectors_path = self.embeddings_connectors.as_ptr();
+                sd_ctx_params.vae_path = self.vae.as_ptr();
+                sd_ctx_params.audio_vae_path = self.audio_vae.as_ptr();
+                sd_ctx_params.taesd_path = self.taesd.as_ptr();
+                sd_ctx_params.control_net_path = self.control_net.as_ptr();
+                sd_ctx_params.embeddings = self.embeddings.2.as_ptr();
+                sd_ctx_params.embedding_count = self.embeddings.1.len() as u32;
+                sd_ctx_params.photo_maker_path = self.photo_maker.as_ptr();
+                sd_ctx_params.pulid_weights_path = self.pulid_weights.as_ptr();
+                sd_ctx_params.tensor_type_rules = null();
+                sd_ctx_params.n_threads = self.n_threads;
+                sd_ctx_params.wtype = self.weight_type;
+                sd_ctx_params.rng_type = self.rng;
+                sd_ctx_params.sampler_rng_type = self.sampler_rng_type;
+                sd_ctx_params.prediction = self.prediction;
+                sd_ctx_params.lora_apply_mode = self.lora_apply_mode;
+                sd_ctx_params.enable_mmap = self.enable_mmap;
+                sd_ctx_params.flash_attn = self.flash_attention;
+                sd_ctx_params.diffusion_flash_attn = self.diffusion_flash_attention;
+                sd_ctx_params.tae_preview_only = self.taesd_preview_only;
+                sd_ctx_params.diffusion_conv_direct = self.diffusion_conv_direct;
+                sd_ctx_params.vae_conv_direct = self.vae_conv_direct;
+                sd_ctx_params.circular_x = self.circular || self.circular_x;
+                sd_ctx_params.circular_y = self.circular || self.circular_y;
+                sd_ctx_params.force_sdxl_vae_conv_scale = self.force_sdxl_vae_conv_scale;
+                sd_ctx_params.chroma_use_dit_mask = !self.chroma_disable_dit_mask;
+                sd_ctx_params.chroma_use_t5_mask = self.chroma_enable_t5_mask;
+                sd_ctx_params.chroma_t5_mask_pad = self.chroma_t5_mask_pad;
+                sd_ctx_params.qwen_image_zero_cond_t = self.use_qwen_image_zero_cond_true;
+                sd_ctx_params.vae_format = self.vae_format;
+                sd_ctx_params.max_vram = max_vram.as_optional_ptr();
+                sd_ctx_params.stream_layers = self.stream_layers;
+                sd_ctx_params.backend = backend.as_optional_ptr();
+                sd_ctx_params.params_backend = params_backend.as_optional_ptr();
+                sd_ctx_params.rpc_servers = self.rpc_servers.as_optional_ptr();
                 let ctx = new_sd_ctx(&sd_ctx_params);
-                self.diffusion_ctx = Some((ctx, sd_ctx_params))
+                self.cancel_state.attach(ctx);
+                self.diffusion_ctx = Some(ctx)
             }
-            self.diffusion_ctx.unwrap().0
+            self.diffusion_ctx.unwrap()
         }
     }
 }
@@ -942,8 +1080,8 @@ impl Drop for ModelConfig {
     fn drop(&mut self) {
         //Cleanup CTX section
         unsafe {
-            if let Some((sd_ctx, _)) = self.diffusion_ctx {
-                free_sd_ctx(sd_ctx);
+            if let Some(sd_ctx) = self.diffusion_ctx {
+                self.cancel_state.free_attached(sd_ctx);
             }
 
             if let Some(upscaler_ctx) = self.upscaler_ctx {
@@ -964,6 +1102,7 @@ impl From<&ModelConfig> for ModelConfigBuilder {
         builder
             .n_threads(value.n_threads)
             .max_vram(value.max_vram)
+            .max_vram_spec(value.max_vram_spec.clone())
             .offload_params_to_cpu(value.offload_params_to_cpu)
             .upscale_repeats(value.upscale_repeats)
             .model(value.model.clone())
@@ -981,6 +1120,7 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .embeddings(&value.embeddings.0)
             .embeddings_connectors(value.embeddings_connectors.clone())
             .photo_maker(value.photo_maker.clone())
+            .pulid_weights(value.pulid_weights.clone())
             .pm_id_embed_path(value.pm_id_embed_path.clone())
             .weight_type(value.weight_type)
             .high_noise_diffusion_model(value.high_noise_diffusion_model.clone())
@@ -992,7 +1132,7 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .vae_extra_tiling_args(value.vae_extra_tiling_args.clone())
             .vae_format(value.vae_format)
             .rng(value.rng)
-            .sampler_rng_type(value.rng)
+            .sampler_rng_type(value.sampler_rng_type)
             .scheduler(value.scheduler)
             .sigmas(value.sigmas.clone())
             .prediction(value.prediction)
@@ -1022,7 +1162,8 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             )
             .extra_sample_params(value.extra_sample_params.clone())
             .backend(value.backend.clone())
-            .params_backend(value.params_backend.clone());
+            .params_backend(value.params_backend.clone())
+            .rpc_servers(value.rpc_servers.clone());
 
         builder.lora_models_internal(value.lora_models.clone());
 
@@ -1099,6 +1240,14 @@ pub struct Config {
     /// Strength for keeping input identity (default: 20%)
     #[builder(default = "20.0")]
     pm_style_strength: f32,
+
+    /// Path to PuLID id embedding
+    #[builder(default = "Default::default()")]
+    pulid_id_embedding: CLibPath,
+
+    /// Strength of PuLID identity injection (default: 1.0)
+    #[builder(default = "1.0")]
+    pulid_id_weight: f32,
 
     /// Strength to apply Control Net (default: 0.9)
     /// 1.0 corresponds to full destruction of information in init
@@ -1620,6 +1769,8 @@ impl From<&Config> for ConfigBuilder {
             .cfg_scale(value.cfg_scale)
             .strength(value.strength)
             .pm_style_strength(value.pm_style_strength)
+            .pulid_id_embedding(value.pulid_id_embedding.clone())
+            .pulid_id_weight(value.pulid_id_weight)
             .control_strength(value.control_strength)
             .height(value.height)
             .width(value.width)
@@ -1707,6 +1858,14 @@ impl CLibString {
         self.0.as_ptr()
     }
 
+    fn is_empty(&self) -> bool {
+        self.0.as_bytes().is_empty()
+    }
+
+    fn to_string_lossy(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+
     fn as_optional_ptr(&self) -> *const c_char {
         if self.0.as_bytes().is_empty() {
             null()
@@ -1726,6 +1885,17 @@ impl From<String> for CLibString {
     fn from(value: String) -> Self {
         Self(CString::new(value).unwrap())
     }
+}
+
+fn prepend_backend_assignment(base: &CLibString, assignments: &[&str]) -> CLibString {
+    let mut parts: Vec<String> = assignments
+        .iter()
+        .map(|assignment| assignment.to_string())
+        .collect();
+    if !base.is_empty() {
+        parts.push(base.to_string_lossy());
+    }
+    CLibString::from(parts.join(","))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1991,10 +2161,9 @@ fn gen_img_maybe_progress(
         let _guard = ScopeGuard;
         let has_init_image = config.init_img.is_present();
         let has_mask_image = config.mask_img.is_present();
-        let has_ref_images = !config.ref_images.is_empty();
 
-        let is_decode_only = !has_init_image && !has_ref_images;
-        let sd_ctx = model_config.diffusion_ctx(is_decode_only);
+        let sd_ctx = model_config.diffusion_ctx();
+        model_config.cancel_state.reset();
         let upscaler_ctx = model_config.upscaler_ctx();
 
         let mut init_image = sd_image_t {
@@ -2065,6 +2234,10 @@ fn gen_img_maybe_progress(
             id_images_count: 0,
             id_embed_path: model_config.pm_id_embed_path.as_ptr(),
             style_strength: config.pm_style_strength,
+        };
+        let pulid_params = sd_pulid_params_t {
+            id_embedding_path: config.pulid_id_embedding.as_ptr(),
+            id_weight: config.pulid_id_weight,
         };
 
         // Declare the buffer in the function scope so it outlives the match block
@@ -2258,31 +2431,32 @@ fn gen_img_maybe_progress(
             &mut hires_custom_sigmas,
         );
 
-        let sd_img_gen_params = sd_img_gen_params_t {
-            prompt: prompt.as_ptr(),
-            negative_prompt: config.negative_prompt.as_ptr(),
-            clip_skip: config.clip_skip as i32,
-            init_image,
-            ref_images: ref_image_ptr,
-            ref_images_count: num_ref_images as i32,
-            increase_ref_index: false,
-            mask_image,
-            width: config.width,
-            height: config.height,
-            sample_params,
-            strength: config.strength,
-            seed: config.seed,
-            batch_count: config.batch_count,
-            control_image,
-            control_strength: config.control_strength,
-            pm_params,
-            vae_tiling_params,
-            auto_resize_ref_image: !config.disable_auto_resize_ref_image,
-            cache,
-            loras: loras.as_ptr(),
-            lora_count: loras.len() as u32,
-            hires,
-        };
+        let mut sd_img_gen_params: sd_img_gen_params_t = std::mem::zeroed();
+        sd_img_gen_params_init(&mut sd_img_gen_params);
+        sd_img_gen_params.prompt = prompt.as_ptr();
+        sd_img_gen_params.negative_prompt = config.negative_prompt.as_ptr();
+        sd_img_gen_params.clip_skip = config.clip_skip as i32;
+        sd_img_gen_params.init_image = init_image;
+        sd_img_gen_params.ref_images = ref_image_ptr;
+        sd_img_gen_params.ref_images_count = num_ref_images as i32;
+        sd_img_gen_params.increase_ref_index = false;
+        sd_img_gen_params.mask_image = mask_image;
+        sd_img_gen_params.width = config.width;
+        sd_img_gen_params.height = config.height;
+        sd_img_gen_params.sample_params = sample_params;
+        sd_img_gen_params.strength = config.strength;
+        sd_img_gen_params.seed = config.seed;
+        sd_img_gen_params.batch_count = config.batch_count;
+        sd_img_gen_params.control_image = control_image;
+        sd_img_gen_params.control_strength = config.control_strength;
+        sd_img_gen_params.pm_params = pm_params;
+        sd_img_gen_params.pulid_params = pulid_params;
+        sd_img_gen_params.vae_tiling_params = vae_tiling_params;
+        sd_img_gen_params.auto_resize_ref_image = !config.disable_auto_resize_ref_image;
+        sd_img_gen_params.cache = cache;
+        sd_img_gen_params.loras = loras.as_ptr();
+        sd_img_gen_params.lora_count = loras.len() as u32;
+        sd_img_gen_params.hires = hires;
 
         let params_str = CString::from_raw(sd_img_gen_params_to_str(&sd_img_gen_params))
             .into_string()
@@ -2291,16 +2465,32 @@ fn gen_img_maybe_progress(
         let slice = generate_image(sd_ctx, &sd_img_gen_params);
         let ret = {
             if slice.is_null() {
+                if model_config.cancel_state.mode() != GenerationCancelMode::Reset {
+                    return Err(DiffusionError::Cancelled);
+                }
                 return Err(DiffusionError::Forward);
             }
             let image_slices = slice::from_raw_parts(slice, config.batch_count as usize);
+            let completed_images = image_slices
+                .iter()
+                .take_while(|img| !img.data.is_null())
+                .count();
+            if completed_images == 0 {
+                return Err(
+                    if model_config.cancel_state.mode() == GenerationCancelMode::Reset {
+                        DiffusionError::Forward
+                    } else {
+                        DiffusionError::Cancelled
+                    },
+                );
+            }
+            if completed_images < image_slices.len()
+                && model_config.cancel_state.mode() != GenerationCancelMode::NewLatents
+            {
+                return Err(DiffusionError::Forward);
+            }
             if ext_sender.is_some() {
-                for img in image_slices.iter() {
-                    // img.data will be null on OOM or other generation errors,
-                    // in which case we skip sending the preview and just return an error
-                    if img.data.is_null() {
-                        return Err(DiffusionError::Forward);
-                    }
+                for img in image_slices.iter().take(completed_images) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
                         Ok(img) => {
                             let len = (img.width * img.height * img.channel) as usize;
@@ -2321,12 +2511,7 @@ fn gen_img_maybe_progress(
                     }
                 }
             } else {
-                for (img, path) in image_slices.iter().zip(files) {
-                    // img.data will be null on OOM or other generation errors,
-                    // in which case we skip saving and just return an error
-                    if img.data.is_null() {
-                        return Err(DiffusionError::Forward);
-                    }
+                for (img, path) in image_slices.iter().take(completed_images).zip(files) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
                         Ok(img) => save_img(img, &path, Some(&params_str))?,
                         Err(err) => {
@@ -2370,10 +2555,9 @@ fn gen_video_maybe_progress(
 
         let has_init_image = config.init_img.is_present();
         let has_end_image = config.end_img.is_present();
-        let has_control_frames = !config.control_frames.is_empty();
 
-        let is_decode_only = !(has_init_image || has_end_image || has_control_frames);
-        let sd_ctx = model_config.diffusion_ctx(is_decode_only);
+        let sd_ctx = model_config.diffusion_ctx();
+        model_config.cancel_state.reset();
 
         let mut init_image = sd_image_t {
             width: 0,
@@ -2627,6 +2811,9 @@ fn gen_video_maybe_progress(
         );
         let ret = {
             if !success || frames_out.is_null() {
+                if model_config.cancel_state.mode() != GenerationCancelMode::Reset {
+                    return Err(DiffusionError::Cancelled);
+                }
                 return Err(DiffusionError::Forward);
             }
             let final_frames = images_from_sd_frames(frames_out, num_frames_out);
@@ -2677,8 +2864,9 @@ mod tests {
     };
 
     use super::{
-        AudioBuffer, ConfigBuilder, ExtProgress, HiresParamsBuilder, Upscaler, VideoConfigBuilder,
-        audio_from_sd_audio, final_video_progress, gen_img, images_from_sd_frames,
+        AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
+        Upscaler, VideoConfigBuilder, audio_from_sd_audio, final_video_progress, gen_img,
+        images_from_sd_frames,
     };
 
     #[test]
@@ -2786,11 +2974,14 @@ mod tests {
             .model(PathBuf::from("./test.ckpt"))
             .audio_vae(PathBuf::from("./audio_vae.gguf"))
             .embeddings_connectors(PathBuf::from("./connectors"))
+            .pulid_weights(PathBuf::from("./pulid.safetensors"))
             .vae_temporal_tiling(true)
             .vae_extra_tiling_args("{\"temporal\":true}")
             .extra_sample_params("{\"sample\":true}")
             .backend("cpu")
             .params_backend("cpu")
+            .rpc_servers("127.0.0.1:50052")
+            .max_vram_spec("cuda=8,cpu=0")
             .hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires.clone(), None)
             .build()
             .unwrap();
@@ -2803,6 +2994,10 @@ mod tests {
             PathBuf::from(&model_config.embeddings_connectors),
             PathBuf::from("./connectors")
         );
+        assert_eq!(
+            PathBuf::from(&model_config.pulid_weights),
+            PathBuf::from("./pulid.safetensors")
+        );
         assert!(model_config.vae_temporal_tiling);
         assert_eq!(
             model_config.vae_extra_tiling_args.0.to_str().unwrap(),
@@ -2814,6 +3009,14 @@ mod tests {
         );
         assert_eq!(model_config.backend.0.to_str().unwrap(), "cpu");
         assert_eq!(model_config.params_backend.0.to_str().unwrap(), "cpu");
+        assert_eq!(
+            model_config.rpc_servers.0.to_str().unwrap(),
+            "127.0.0.1:50052"
+        );
+        assert_eq!(
+            model_config.max_vram_spec.0.to_str().unwrap(),
+            "cuda=8,cpu=0"
+        );
         assert_eq!(model_config.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
 
         let video_config = VideoConfigBuilder::default()
@@ -2837,6 +3040,47 @@ mod tests {
         let rebuilt = VideoConfigBuilder::from(video_config).build().unwrap();
         assert_eq!(rebuilt.fps, 24);
         assert_eq!(rebuilt.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
+
+        let image_config = ConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .pulid_id_embedding(PathBuf::from("./pulid-id.safetensors"))
+            .pulid_id_weight(0.75)
+            .build()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(&image_config.pulid_id_embedding),
+            PathBuf::from("./pulid-id.safetensors")
+        );
+        assert_eq!(image_config.pulid_id_weight, 0.75);
+    }
+
+    #[test]
+    fn test_cancel_handle_without_context() {
+        let model_config = ModelConfigBuilder::default()
+            .model(PathBuf::from("./test.ckpt"))
+            .build()
+            .unwrap();
+        let handle = model_config.cancel_handle();
+
+        assert!(!handle.cancel());
+        assert!(!handle.cancel_new_latents());
+        assert!(!handle.reset());
+    }
+
+    #[test]
+    fn test_generation_cancel_mode_mapping() {
+        assert_eq!(
+            diffusion_rs_sys::sd_cancel_mode_t::from(GenerationCancelMode::All),
+            diffusion_rs_sys::sd_cancel_mode_t::SD_CANCEL_ALL
+        );
+        assert_eq!(
+            diffusion_rs_sys::sd_cancel_mode_t::from(GenerationCancelMode::NewLatents),
+            diffusion_rs_sys::sd_cancel_mode_t::SD_CANCEL_NEW_LATENTS
+        );
+        assert_eq!(
+            diffusion_rs_sys::sd_cancel_mode_t::from(GenerationCancelMode::Reset),
+            diffusion_rs_sys::sd_cancel_mode_t::SD_CANCEL_RESET
+        );
     }
 
     #[test]
