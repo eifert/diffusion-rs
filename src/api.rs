@@ -44,7 +44,9 @@ use diffusion_rs_sys::sd_log_level_t;
 use diffusion_rs_sys::sd_lora_t;
 use diffusion_rs_sys::sd_pm_params_t;
 use diffusion_rs_sys::sd_pulid_params_t;
+use diffusion_rs_sys::sd_sample_method_name;
 use diffusion_rs_sys::sd_sample_params_t;
+use diffusion_rs_sys::sd_scheduler_name;
 use diffusion_rs_sys::sd_set_log_callback;
 use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
@@ -94,11 +96,156 @@ pub use diffusion_rs_sys::sd_hires_upscaler_t as Upscaler;
 pub use diffusion_rs_sys::sd_log_level_t as LogLevel;
 
 static VALID_EXT: [&str; 3] = ["gguf", "safetensors", "pt"];
+const SAMPLE_METHODS: [SampleMethod; SampleMethod::SAMPLE_METHOD_COUNT as usize] = [
+    SampleMethod::EULER_SAMPLE_METHOD,
+    SampleMethod::EULER_A_SAMPLE_METHOD,
+    SampleMethod::HEUN_SAMPLE_METHOD,
+    SampleMethod::DPM2_SAMPLE_METHOD,
+    SampleMethod::DPMPP2S_A_SAMPLE_METHOD,
+    SampleMethod::DPMPP2M_SAMPLE_METHOD,
+    SampleMethod::DPMPP2Mv2_SAMPLE_METHOD,
+    SampleMethod::IPNDM_SAMPLE_METHOD,
+    SampleMethod::IPNDM_V_SAMPLE_METHOD,
+    SampleMethod::LCM_SAMPLE_METHOD,
+    SampleMethod::DDIM_TRAILING_SAMPLE_METHOD,
+    SampleMethod::TCD_SAMPLE_METHOD,
+    SampleMethod::RES_MULTISTEP_SAMPLE_METHOD,
+    SampleMethod::RES_2S_SAMPLE_METHOD,
+    SampleMethod::ER_SDE_SAMPLE_METHOD,
+    SampleMethod::EULER_CFG_PP_SAMPLE_METHOD,
+    SampleMethod::EULER_A_CFG_PP_SAMPLE_METHOD,
+    SampleMethod::EULER_GE_SAMPLE_METHOD,
+    SampleMethod::DPMPP2M_SDE_SAMPLE_METHOD,
+    SampleMethod::DPMPP2M_SDE_BT_SAMPLE_METHOD,
+];
+const SCHEDULERS: [Scheduler; Scheduler::SCHEDULER_COUNT as usize] = [
+    Scheduler::DISCRETE_SCHEDULER,
+    Scheduler::KARRAS_SCHEDULER,
+    Scheduler::EXPONENTIAL_SCHEDULER,
+    Scheduler::AYS_SCHEDULER,
+    Scheduler::GITS_SCHEDULER,
+    Scheduler::SGM_UNIFORM_SCHEDULER,
+    Scheduler::SIMPLE_SCHEDULER,
+    Scheduler::SMOOTHSTEP_SCHEDULER,
+    Scheduler::KL_OPTIMAL_SCHEDULER,
+    Scheduler::LCM_SCHEDULER,
+    Scheduler::BONG_TANGENT_SCHEDULER,
+    Scheduler::LTX2_SCHEDULER,
+    Scheduler::LOGIT_NORMAL_SCHEDULER,
+    Scheduler::FLUX2_SCHEDULER,
+    Scheduler::FLUX_SCHEDULER,
+    Scheduler::BETA_SCHEDULER,
+];
+// Keep these assertions in sync with stable-diffusion.cpp so enum drift fails the build.
+const _: [(); 0] = [(); SampleMethod::EULER_SAMPLE_METHOD as usize];
+const _: [(); 1] = [(); SampleMethod::EULER_A_SAMPLE_METHOD as usize];
+const _: [(); 2] = [(); SampleMethod::HEUN_SAMPLE_METHOD as usize];
+const _: [(); 3] = [(); SampleMethod::DPM2_SAMPLE_METHOD as usize];
+const _: [(); 4] = [(); SampleMethod::DPMPP2S_A_SAMPLE_METHOD as usize];
+const _: [(); 5] = [(); SampleMethod::DPMPP2M_SAMPLE_METHOD as usize];
+const _: [(); 6] = [(); SampleMethod::DPMPP2Mv2_SAMPLE_METHOD as usize];
+const _: [(); 7] = [(); SampleMethod::IPNDM_SAMPLE_METHOD as usize];
+const _: [(); 8] = [(); SampleMethod::IPNDM_V_SAMPLE_METHOD as usize];
+const _: [(); 9] = [(); SampleMethod::LCM_SAMPLE_METHOD as usize];
+const _: [(); 10] = [(); SampleMethod::DDIM_TRAILING_SAMPLE_METHOD as usize];
+const _: [(); 11] = [(); SampleMethod::TCD_SAMPLE_METHOD as usize];
+const _: [(); 12] = [(); SampleMethod::RES_MULTISTEP_SAMPLE_METHOD as usize];
+const _: [(); 13] = [(); SampleMethod::RES_2S_SAMPLE_METHOD as usize];
+const _: [(); 14] = [(); SampleMethod::ER_SDE_SAMPLE_METHOD as usize];
+const _: [(); 15] = [(); SampleMethod::EULER_CFG_PP_SAMPLE_METHOD as usize];
+const _: [(); 16] = [(); SampleMethod::EULER_A_CFG_PP_SAMPLE_METHOD as usize];
+const _: [(); 17] = [(); SampleMethod::EULER_GE_SAMPLE_METHOD as usize];
+const _: [(); 18] = [(); SampleMethod::DPMPP2M_SDE_SAMPLE_METHOD as usize];
+const _: [(); 19] = [(); SampleMethod::DPMPP2M_SDE_BT_SAMPLE_METHOD as usize];
+const _: [(); 20] = [(); SampleMethod::SAMPLE_METHOD_COUNT as usize];
+const _: [(); 0] = [(); Scheduler::DISCRETE_SCHEDULER as usize];
+const _: [(); 1] = [(); Scheduler::KARRAS_SCHEDULER as usize];
+const _: [(); 2] = [(); Scheduler::EXPONENTIAL_SCHEDULER as usize];
+const _: [(); 3] = [(); Scheduler::AYS_SCHEDULER as usize];
+const _: [(); 4] = [(); Scheduler::GITS_SCHEDULER as usize];
+const _: [(); 5] = [(); Scheduler::SGM_UNIFORM_SCHEDULER as usize];
+const _: [(); 6] = [(); Scheduler::SIMPLE_SCHEDULER as usize];
+const _: [(); 7] = [(); Scheduler::SMOOTHSTEP_SCHEDULER as usize];
+const _: [(); 8] = [(); Scheduler::KL_OPTIMAL_SCHEDULER as usize];
+const _: [(); 9] = [(); Scheduler::LCM_SCHEDULER as usize];
+const _: [(); 10] = [(); Scheduler::BONG_TANGENT_SCHEDULER as usize];
+const _: [(); 11] = [(); Scheduler::LTX2_SCHEDULER as usize];
+const _: [(); 12] = [(); Scheduler::LOGIT_NORMAL_SCHEDULER as usize];
+const _: [(); 13] = [(); Scheduler::FLUX2_SCHEDULER as usize];
+const _: [(); 14] = [(); Scheduler::FLUX_SCHEDULER as usize];
+const _: [(); 15] = [(); Scheduler::BETA_SCHEDULER as usize];
+const _: [(); 16] = [(); Scheduler::SCHEDULER_COUNT as usize];
 type SdLogger = dyn Fn(LogLevel, &str) + Send + Sync + 'static;
 static SD_LOGGER: OnceLock<RwLock<Option<Arc<SdLogger>>>> = OnceLock::new();
+static SAMPLER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+static SCHEDULER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
 fn sd_logger() -> &'static RwLock<Option<Arc<SdLogger>>> {
     SD_LOGGER.get_or_init(|| RwLock::new(None))
+}
+
+fn native_name(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+fn native_sampler_name(sample_method: SampleMethod) -> Option<String> {
+    native_name(unsafe { sd_sample_method_name(sample_method) })
+}
+
+fn native_scheduler_name(scheduler: Scheduler) -> Option<String> {
+    native_name(unsafe { sd_scheduler_name(scheduler) })
+}
+
+/// Return the stable-diffusion.cpp name for a sampler.
+pub fn sampler_name(sample_method: SampleMethod) -> Option<&'static str> {
+    SAMPLE_METHODS
+        .iter()
+        .position(|candidate| *candidate == sample_method)
+        .and_then(|index| sampler_names().get(index))
+        .map(String::as_str)
+}
+
+/// Return the stable-diffusion.cpp name for a scheduler.
+pub fn scheduler_name(scheduler: Scheduler) -> Option<&'static str> {
+    SCHEDULERS
+        .iter()
+        .position(|candidate| *candidate == scheduler)
+        .and_then(|index| scheduler_names().get(index))
+        .map(String::as_str)
+}
+
+/// Return all sampler names exposed by stable-diffusion.cpp.
+pub fn sampler_names() -> &'static [String] {
+    SAMPLER_NAMES.get_or_init(|| {
+        SAMPLE_METHODS
+            .iter()
+            .map(|sample_method| {
+                native_sampler_name(*sample_method)
+                    .expect("stable-diffusion.cpp returned a null sampler name")
+            })
+            .collect()
+    })
+}
+
+/// Return all scheduler names exposed by stable-diffusion.cpp.
+pub fn scheduler_names() -> &'static [String] {
+    SCHEDULER_NAMES.get_or_init(|| {
+        SCHEDULERS
+            .iter()
+            .map(|scheduler| {
+                native_scheduler_name(*scheduler)
+                    .expect("stable-diffusion.cpp returned a null scheduler name")
+            })
+            .collect()
+    })
 }
 
 #[repr(i32)]
@@ -2943,8 +3090,8 @@ mod tests {
 
     use super::{
         AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
-        Upscaler, VideoConfigBuilder, audio_from_sd_audio, final_video_progress, gen_img,
-        images_from_sd_frames,
+        SampleMethod, Scheduler, Upscaler, VideoConfigBuilder, audio_from_sd_audio,
+        final_video_progress, gen_img, images_from_sd_frames,
     };
 
     #[test]
@@ -3159,6 +3306,30 @@ mod tests {
             diffusion_rs_sys::sd_cancel_mode_t::from(GenerationCancelMode::Reset),
             diffusion_rs_sys::sd_cancel_mode_t::SD_CANCEL_RESET
         );
+    }
+
+    #[test]
+    fn test_sampler_names_exposed() {
+        let names = super::sampler_names();
+
+        assert_eq!(names.len(), SampleMethod::SAMPLE_METHOD_COUNT as usize);
+        assert_eq!(
+            super::sampler_name(SampleMethod::EULER_SAMPLE_METHOD),
+            Some("euler")
+        );
+        assert!(names.iter().any(|name| name == "dpm++2m_sde_bt"));
+    }
+
+    #[test]
+    fn test_scheduler_names_exposed() {
+        let names = super::scheduler_names();
+
+        assert_eq!(names.len(), Scheduler::SCHEDULER_COUNT as usize);
+        assert_eq!(
+            super::scheduler_name(Scheduler::DISCRETE_SCHEDULER),
+            Some("discrete")
+        );
+        assert!(names.iter().any(|name| name == "sgm_uniform"));
     }
 
     #[test]
