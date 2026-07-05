@@ -2057,30 +2057,94 @@ fn final_video_progress(final_frames: Vec<RgbImage>, audio: *const sd_audio_t) -
     }
 }
 
+struct OwnedSdImages {
+    ptr: *mut sd_image_t,
+    len: i32,
+}
+
+impl OwnedSdImages {
+    unsafe fn new(ptr: *mut sd_image_t, len: i32) -> Option<Self> {
+        if ptr.is_null() || len <= 0 {
+            None
+        } else {
+            Some(Self { ptr, len })
+        }
+    }
+
+    fn as_slice(&self) -> &[sd_image_t] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len as usize) }
+    }
+
+    fn first(&self) -> Option<sd_image_t> {
+        self.as_slice().first().copied()
+    }
+}
+
+impl Drop for OwnedSdImages {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            unsafe {
+                free_sd_images(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+struct GeneratedImage {
+    image: sd_image_t,
+    _owner: Option<OwnedSdImages>,
+}
+
+impl GeneratedImage {
+    fn as_image(&self) -> sd_image_t {
+        self.image
+    }
+}
+
 unsafe fn upscale(
     upscale_repeats: i32,
     upscaler_ctx: Option<*mut upscaler_ctx_t>,
     data: sd_image_t,
-) -> Result<sd_image_t, DiffusionError> {
+) -> Result<GeneratedImage, DiffusionError> {
     unsafe {
         match upscaler_ctx {
             Some(upscaler_ctx) => {
                 let upscale_factor = 4; // unused for RealESRGAN_x4plus_anime_6B.pth
                 let mut current_image = data;
+                let mut current_owner = None;
                 for _ in 0..upscale_repeats {
-                    let upscaled_image =
-                        diffusion_rs_sys::upscale(upscaler_ctx, current_image, upscale_factor);
-
-                    if upscaled_image.data.is_null() {
+                    let mut images_out = null_mut();
+                    let mut num_images_out = 0;
+                    let success = diffusion_rs_sys::upscale(
+                        upscaler_ctx,
+                        current_image,
+                        upscale_factor,
+                        &mut images_out,
+                        &mut num_images_out,
+                    );
+                    let owned_images = OwnedSdImages::new(images_out, num_images_out);
+                    let Some(upscaled_image) = owned_images
+                        .as_ref()
+                        .and_then(OwnedSdImages::first)
+                        .filter(|image| !image.data.is_null())
+                    else {
+                        return Err(DiffusionError::Upscaler);
+                    };
+                    if !success {
                         return Err(DiffusionError::Upscaler);
                     }
-
-                    free_sd_images(&mut current_image, 1);
                     current_image = upscaled_image;
+                    current_owner = owned_images;
                 }
-                Ok(current_image)
+                Ok(GeneratedImage {
+                    image: current_image,
+                    _owner: current_owner,
+                })
             }
-            None => Ok(data),
+            None => Ok(GeneratedImage {
+                image: data,
+                _owner: None,
+            }),
         }
     }
 }
@@ -2462,15 +2526,29 @@ fn gen_img_maybe_progress(
             .into_string()
             .unwrap();
 
-        let slice = generate_image(sd_ctx, &sd_img_gen_params);
+        let mut images_out = null_mut();
+        let mut num_images_out = 0;
+        let success = generate_image(
+            sd_ctx,
+            &sd_img_gen_params,
+            &mut images_out,
+            &mut num_images_out,
+        );
+        let generated_images = OwnedSdImages::new(images_out, num_images_out);
         let ret = {
-            if slice.is_null() {
+            if !success {
                 if model_config.cancel_state.mode() != GenerationCancelMode::Reset {
                     return Err(DiffusionError::Cancelled);
                 }
                 return Err(DiffusionError::Forward);
             }
-            let image_slices = slice::from_raw_parts(slice, config.batch_count as usize);
+            let Some(generated_images) = generated_images.as_ref() else {
+                if model_config.cancel_state.mode() != GenerationCancelMode::Reset {
+                    return Err(DiffusionError::Cancelled);
+                }
+                return Err(DiffusionError::Forward);
+            };
+            let image_slices = generated_images.as_slice();
             let completed_images = image_slices
                 .iter()
                 .take_while(|img| !img.data.is_null())
@@ -2492,7 +2570,8 @@ fn gen_img_maybe_progress(
             if ext_sender.is_some() {
                 for img in image_slices.iter().take(completed_images) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
-                        Ok(img) => {
+                        Ok(upscaled) => {
+                            let img = upscaled.as_image();
                             let len = (img.width * img.height * img.channel) as usize;
                             let buffer = slice::from_raw_parts(img.data, len).to_vec();
                             let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
@@ -2513,7 +2592,7 @@ fn gen_img_maybe_progress(
             } else {
                 for (img, path) in image_slices.iter().take(completed_images).zip(files) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
-                        Ok(img) => save_img(img, &path, Some(&params_str))?,
+                        Ok(upscaled) => save_img(upscaled.as_image(), &path, Some(&params_str))?,
                         Err(err) => {
                             return Err(err);
                         }
@@ -2522,7 +2601,6 @@ fn gen_img_maybe_progress(
             }
             Ok(())
         };
-        free_sd_images(slice, config.batch_count);
         ret
     }
 }
