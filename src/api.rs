@@ -58,6 +58,7 @@ use diffusion_rs_sys::upscaler_ctx_t;
 use image::ImageBuffer;
 use image::ImageError;
 use image::RgbImage;
+use libc::free as libc_free;
 use little_exif::exif_tag::ExifTag;
 use little_exif::metadata::Metadata;
 use thiserror::Error;
@@ -295,6 +296,9 @@ impl GenerationCancelState {
         if *guard == ctx as usize {
             *guard = 0;
         }
+        if ctx.is_null() {
+            return;
+        }
         unsafe {
             free_sd_ctx(ctx);
         }
@@ -448,6 +452,8 @@ pub enum ExtProgress {
 pub enum DiffusionError {
     #[error("The underling stablediffusion.cpp function returned NULL")]
     Forward,
+    #[error("Failed to initialize the stable-diffusion.cpp context")]
+    ContextInit,
     #[error("Generation was cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -456,6 +462,8 @@ pub enum DiffusionError {
     Io(#[from] std::io::Error),
     #[error("The underling upscaler model returned a NULL image")]
     Upscaler,
+    #[error("Failed to allocate a native stable-diffusion.cpp string")]
+    NativeString,
     #[error(transparent)]
     Utf8(#[from] std::ffi::IntoStringError),
 }
@@ -1106,8 +1114,9 @@ impl ModelConfig {
     /// This lazily initializes the diffusion context if needed.
     pub fn supports_image_generation(&mut self) -> bool {
         unsafe {
-            let ctx = self.diffusion_ctx();
-            sd_ctx_supports_image_generation(ctx)
+            self.diffusion_ctx()
+                .map(|ctx| sd_ctx_supports_image_generation(ctx))
+                .unwrap_or(false)
         }
     }
 
@@ -1116,15 +1125,16 @@ impl ModelConfig {
     /// This lazily initializes the diffusion context if needed.
     pub fn supports_video_generation(&mut self) -> bool {
         unsafe {
-            let ctx = self.diffusion_ctx();
-            sd_ctx_supports_video_generation(ctx)
+            self.diffusion_ctx()
+                .map(|ctx| sd_ctx_supports_video_generation(ctx))
+                .unwrap_or(false)
         }
     }
 
-    unsafe fn upscaler_ctx(&mut self) -> Option<*mut upscaler_ctx_t> {
+    unsafe fn upscaler_ctx(&mut self) -> Result<Option<*mut upscaler_ctx_t>, DiffusionError> {
         unsafe {
             if self.upscale_model.is_none() || self.upscale_repeats == 0 {
-                None
+                Ok(None)
             } else {
                 if self.upscaler_ctx.is_none() {
                     let upscaler = new_upscaler_ctx(
@@ -1135,14 +1145,17 @@ impl ModelConfig {
                         self.backend.as_optional_ptr(),
                         self.params_backend.as_optional_ptr(),
                     );
+                    if upscaler.is_null() {
+                        return Err(DiffusionError::Upscaler);
+                    }
                     self.upscaler_ctx = Some(upscaler);
                 }
-                self.upscaler_ctx
+                Ok(self.upscaler_ctx)
             }
         }
     }
 
-    unsafe fn diffusion_ctx(&mut self) -> *mut sd_ctx_t {
+    unsafe fn diffusion_ctx(&mut self) -> Result<*mut sd_ctx_t, DiffusionError> {
         unsafe {
             if self.diffusion_ctx.is_none() {
                 let runtime_assignments: Vec<&str> = [
@@ -1215,10 +1228,13 @@ impl ModelConfig {
                 sd_ctx_params.params_backend = params_backend.as_optional_ptr();
                 sd_ctx_params.rpc_servers = self.rpc_servers.as_optional_ptr();
                 let ctx = new_sd_ctx(&sd_ctx_params);
+                if ctx.is_null() {
+                    return Err(DiffusionError::ContextInit);
+                }
                 self.cancel_state.attach(ctx);
-                self.diffusion_ctx = Some(ctx)
+                self.diffusion_ctx = Some(ctx);
             }
-            self.diffusion_ctx.unwrap()
+            Ok(self.diffusion_ctx.unwrap())
         }
     }
 }
@@ -1227,11 +1243,11 @@ impl Drop for ModelConfig {
     fn drop(&mut self) {
         //Cleanup CTX section
         unsafe {
-            if let Some(sd_ctx) = self.diffusion_ctx {
+            if let Some(sd_ctx) = self.diffusion_ctx.filter(|ctx| !ctx.is_null()) {
                 self.cancel_state.free_attached(sd_ctx);
             }
 
-            if let Some(upscaler_ctx) = self.upscaler_ctx {
+            if let Some(upscaler_ctx) = self.upscaler_ctx.filter(|ctx| !ctx.is_null()) {
                 free_upscaler_ctx(upscaler_ctx);
             }
         }
@@ -2156,10 +2172,33 @@ fn make_hires_params(
     }
 }
 
+fn sd_image_len(img: sd_image_t) -> Option<usize> {
+    if img.data.is_null() || img.width == 0 || img.height == 0 || img.channel == 0 {
+        return None;
+    }
+
+    let width = usize::try_from(img.width).ok()?;
+    let height = usize::try_from(img.height).ok()?;
+    let channels = usize::try_from(img.channel).ok()?;
+    width.checked_mul(height)?.checked_mul(channels)
+}
+
 fn image_from_sd_image(img: sd_image_t) -> Option<RgbImage> {
-    let len = (img.width * img.height * img.channel) as usize;
+    let len = sd_image_len(img)?;
     let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
     ImageBuffer::from_raw(img.width, img.height, buffer).map(RgbImage::from)
+}
+
+unsafe fn owned_native_string(ptr: *mut c_char) -> Result<String, DiffusionError> {
+    if ptr.is_null() {
+        return Err(DiffusionError::NativeString);
+    }
+
+    let result = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+    unsafe {
+        libc_free(ptr.cast());
+    }
+    Ok(result)
 }
 
 fn images_from_sd_frames(frames: *mut sd_image_t, frame_count: i32) -> Vec<RgbImage> {
@@ -2373,9 +2412,9 @@ fn gen_img_maybe_progress(
         let has_init_image = config.init_img.is_present();
         let has_mask_image = config.mask_img.is_present();
 
-        let sd_ctx = model_config.diffusion_ctx();
+        let sd_ctx = model_config.diffusion_ctx()?;
         model_config.cancel_state.reset();
-        let upscaler_ctx = model_config.upscaler_ctx();
+        let upscaler_ctx = model_config.upscaler_ctx()?;
 
         let mut init_image = sd_image_t {
             width: 0,
@@ -2669,9 +2708,7 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.lora_count = loras.len() as u32;
         sd_img_gen_params.hires = hires;
 
-        let params_str = CString::from_raw(sd_img_gen_params_to_str(&sd_img_gen_params))
-            .into_string()
-            .unwrap();
+        let params_str = owned_native_string(sd_img_gen_params_to_str(&sd_img_gen_params))?;
 
         let mut images_out = null_mut();
         let mut num_images_out = 0;
@@ -2718,11 +2755,7 @@ fn gen_img_maybe_progress(
                 for img in image_slices.iter().take(completed_images) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
                         Ok(upscaled) => {
-                            let img = upscaled.as_image();
-                            let len = (img.width * img.height * img.channel) as usize;
-                            let buffer = slice::from_raw_parts(img.data, len).to_vec();
-                            let _ = ImageBuffer::from_raw(img.width, img.height, buffer)
-                                .map(|img| RgbImage::from(img))
+                            let _ = image_from_sd_image(upscaled.as_image())
                                 .and_then(|img| {
                                     ext_sender
                                         .as_ref()
@@ -2781,7 +2814,7 @@ fn gen_video_maybe_progress(
         let has_init_image = config.init_img.is_present();
         let has_end_image = config.end_img.is_present();
 
-        let sd_ctx = model_config.diffusion_ctx();
+        let sd_ctx = model_config.diffusion_ctx()?;
         model_config.cancel_state.reset();
 
         let mut init_image = sd_image_t {
@@ -3057,16 +3090,10 @@ fn gen_video_maybe_progress(
 
 fn save_img(img: sd_image_t, path: &Path, params: Option<&str>) -> Result<(), DiffusionError> {
     // Thx @wandbrandon
-    let len = (img.width * img.height * img.channel) as usize;
-    let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
-    let save_state = ImageBuffer::from_raw(img.width, img.height, buffer).map(|img| {
-        RgbImage::from(img)
-            .save(path)
-            .map_err(DiffusionError::StoreImages)
-    });
-    if let Some(Err(err)) = save_state {
-        return Err(err);
-    }
+    let Some(image) = image_from_sd_image(img) else {
+        return Err(DiffusionError::Forward);
+    };
+    image.save(path).map_err(DiffusionError::StoreImages)?;
     if let Some(params) = params {
         let mut metadata = Metadata::new();
         metadata.set_tag(ExifTag::ImageDescription(params.to_string()));
@@ -3081,7 +3108,7 @@ mod tests {
     use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
     use std::fs;
     use std::path::PathBuf;
-    use std::ptr::null;
+    use std::ptr::{null, null_mut};
 
     use crate::{
         api::{ConfigBuilderError, ModelConfigBuilder},
@@ -3091,7 +3118,7 @@ mod tests {
     use super::{
         AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
         SampleMethod, Scheduler, Upscaler, VideoConfigBuilder, audio_from_sd_audio,
-        final_video_progress, gen_img, images_from_sd_frames,
+        final_video_progress, gen_img, image_from_sd_image, images_from_sd_frames,
     };
 
     #[test]
@@ -3355,6 +3382,18 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].get_pixel(0, 0).0, [255, 0, 0]);
         assert_eq!(images[1].get_pixel(1, 0).0, [255, 255, 0]);
+    }
+
+    #[test]
+    fn test_image_from_sd_image_rejects_null_data() {
+        let image = sd_image_t {
+            width: 1,
+            height: 1,
+            channel: 3,
+            data: null_mut(),
+        };
+
+        assert!(image_from_sd_image(image).is_none());
     }
 
     #[test]
