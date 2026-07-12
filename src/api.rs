@@ -1179,6 +1179,13 @@ impl ModelConfig {
                 } else {
                     self.max_vram_spec.clone()
                 };
+                let model_args = CLibString::from(format!(
+                    "chroma_use_dit_mask={},chroma_use_t5_mask={},chroma_t5_mask_pad={},qwen_image_zero_cond_t={}",
+                    !self.chroma_disable_dit_mask,
+                    self.chroma_enable_t5_mask,
+                    self.chroma_t5_mask_pad,
+                    self.use_qwen_image_zero_cond_true,
+                ));
                 let mut sd_ctx_params: sd_ctx_params_t = std::mem::zeroed();
                 sd_ctx_params_init(&mut sd_ctx_params);
                 sd_ctx_params.model_path = self.model.as_ptr();
@@ -1214,19 +1221,14 @@ impl ModelConfig {
                 sd_ctx_params.tae_preview_only = self.taesd_preview_only;
                 sd_ctx_params.diffusion_conv_direct = self.diffusion_conv_direct;
                 sd_ctx_params.vae_conv_direct = self.vae_conv_direct;
-                sd_ctx_params.circular_x = self.circular || self.circular_x;
-                sd_ctx_params.circular_y = self.circular || self.circular_y;
                 sd_ctx_params.force_sdxl_vae_conv_scale = self.force_sdxl_vae_conv_scale;
-                sd_ctx_params.chroma_use_dit_mask = !self.chroma_disable_dit_mask;
-                sd_ctx_params.chroma_use_t5_mask = self.chroma_enable_t5_mask;
-                sd_ctx_params.chroma_t5_mask_pad = self.chroma_t5_mask_pad;
-                sd_ctx_params.qwen_image_zero_cond_t = self.use_qwen_image_zero_cond_true;
                 sd_ctx_params.vae_format = self.vae_format;
                 sd_ctx_params.max_vram = max_vram.as_optional_ptr();
                 sd_ctx_params.stream_layers = self.stream_layers;
                 sd_ctx_params.backend = backend.as_optional_ptr();
                 sd_ctx_params.params_backend = params_backend.as_optional_ptr();
                 sd_ctx_params.rpc_servers = self.rpc_servers.as_optional_ptr();
+                sd_ctx_params.model_args = model_args.as_ptr();
                 let ctx = new_sd_ctx(&sd_ctx_params);
                 if ctx.is_null() {
                     return Err(DiffusionError::ContextInit);
@@ -2707,6 +2709,8 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.loras = loras.as_ptr();
         sd_img_gen_params.lora_count = loras.len() as u32;
         sd_img_gen_params.hires = hires;
+        sd_img_gen_params.circular_x = model_config.circular || model_config.circular_x;
+        sd_img_gen_params.circular_y = model_config.circular || model_config.circular_y;
 
         let params_str = owned_native_string(sd_img_gen_params_to_str(&sd_img_gen_params))?;
 
@@ -3056,6 +3060,8 @@ fn gen_video_maybe_progress(
             vae_tiling_params,
             cache,
             hires,
+            circular_x: model_config.circular || model_config.circular_x,
+            circular_y: model_config.circular || model_config.circular_y,
         };
 
         let mut frames_out: *mut sd_image_t = null_mut();
