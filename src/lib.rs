@@ -7,6 +7,8 @@ pub mod preset;
 
 /// Add additional resources to [preset::Preset]
 pub mod modifier;
+/// Serializable configuration-file types that convert into validated API configs.
+pub mod params;
 pub(crate) mod preset_builder;
 
 /// Util module
