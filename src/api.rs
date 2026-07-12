@@ -573,6 +573,12 @@ pub struct SpectrumCacheParams {
     /// Stop caching at this fraction of total steps
     #[builder(default = "0.9")]
     stop: f32,
+
+    #[builder(default = "-1")]
+    max_cached_steps: i32,
+
+    #[builder(default = "-1")]
+    max_continuous_cached_steps: i32,
 }
 
 /// Parameters for UCache
@@ -603,6 +609,12 @@ pub struct UCacheParams {
     /// false: Keeps error accumulated. More conservative, recommended for euler_a sampler
     #[builder(default = "true")]
     reset: bool,
+
+    #[builder(default = "-1")]
+    max_cached_steps: i32,
+
+    #[builder(default = "-1")]
+    max_continuous_cached_steps: i32,
 }
 
 /// Parameters for Easy Cache
@@ -619,6 +631,12 @@ pub struct EasyCacheParams {
     /// Stop caching at this percent of steps
     #[builder(default = "0.95")]
     end: f32,
+
+    #[builder(default = "-1")]
+    max_cached_steps: i32,
+
+    #[builder(default = "-1")]
+    max_continuous_cached_steps: i32,
 }
 
 /// Parameters for Db Cache
@@ -649,6 +667,28 @@ pub struct DbCacheParams {
     /// Scm Policy
     #[builder(default = "ScmPolicy::default()")]
     scm_policy_dynamic: ScmPolicy,
+
+    #[builder(default = "-1")]
+    max_cached_steps: i32,
+
+    #[builder(default = "-1")]
+    max_continuous_cached_steps: i32,
+}
+
+/// Parameters for TaylorSeer caching.
+#[derive(Builder, Debug, Clone)]
+pub struct TaylorSeerCacheParams {
+    #[builder(default = "1")]
+    n_derivatives: i32,
+
+    #[builder(default = "1")]
+    skip_interval: i32,
+
+    #[builder(default = "-1")]
+    max_cached_steps: i32,
+
+    #[builder(default = "-1")]
+    max_continuous_cached_steps: i32,
 }
 
 /// Steps Computation Mask Policy controls when to cache steps
@@ -719,6 +759,10 @@ pub struct ModelConfig {
     /// Enable layer streaming when max_vram is used
     #[builder(default = "false")]
     stream_layers: bool,
+
+    /// Load all parameters eagerly when creating the model context.
+    #[builder(default = "false")]
+    eager_load: bool,
 
     /// Path to esrgan model. Upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now
     #[builder(default = "Default::default()")]
@@ -807,6 +851,10 @@ pub struct ModelConfig {
     /// Weight type. If not specified, the default is the type of the weight file
     #[builder(default = "WeightType::SD_TYPE_COUNT")]
     weight_type: WeightType,
+
+    /// Per-tensor weight type rules in stable-diffusion.cpp format.
+    #[builder(default = "CLibString::default()")]
+    tensor_type_rules: CLibString,
 
     /// Lora model directory
     #[builder(default = "Default::default()", setter(custom))]
@@ -971,9 +1019,21 @@ pub struct ModelConfig {
     #[builder(default = "CLibString::default()")]
     params_backend: CLibString,
 
+    /// Multi-device weight split mode or per-module split assignments.
+    #[builder(default = "CLibString::default()")]
+    split_mode: CLibString,
+
+    /// Automatically fit model execution to available device memory.
+    #[builder(default = "false")]
+    auto_fit: bool,
+
     /// Comma-separated RPC server list
     #[builder(default = "CLibString::default()")]
     rpc_servers: CLibString,
+
+    /// Additional model-specific key/value arguments.
+    #[builder(default = "CLibString::default()")]
+    model_args: CLibString,
 }
 
 impl ModelConfigBuilder {
@@ -1179,13 +1239,16 @@ impl ModelConfig {
                 } else {
                     self.max_vram_spec.clone()
                 };
-                let model_args = CLibString::from(format!(
-                    "chroma_use_dit_mask={},chroma_use_t5_mask={},chroma_t5_mask_pad={},qwen_image_zero_cond_t={}",
-                    !self.chroma_disable_dit_mask,
-                    self.chroma_enable_t5_mask,
-                    self.chroma_t5_mask_pad,
-                    self.use_qwen_image_zero_cond_true,
-                ));
+                let compatibility_model_args = [
+                    format!("chroma_use_dit_mask={}", !self.chroma_disable_dit_mask),
+                    format!("chroma_use_t5_mask={}", self.chroma_enable_t5_mask),
+                    format!("chroma_t5_mask_pad={}", self.chroma_t5_mask_pad),
+                    format!(
+                        "qwen_image_zero_cond_t={}",
+                        self.use_qwen_image_zero_cond_true
+                    ),
+                ];
+                let model_args = append_key_value_args(&compatibility_model_args, &self.model_args);
                 let mut sd_ctx_params: sd_ctx_params_t = std::mem::zeroed();
                 sd_ctx_params_init(&mut sd_ctx_params);
                 sd_ctx_params.model_path = self.model.as_ptr();
@@ -1208,7 +1271,7 @@ impl ModelConfig {
                 sd_ctx_params.embedding_count = self.embeddings.1.len() as u32;
                 sd_ctx_params.photo_maker_path = self.photo_maker.as_ptr();
                 sd_ctx_params.pulid_weights_path = self.pulid_weights.as_ptr();
-                sd_ctx_params.tensor_type_rules = null();
+                sd_ctx_params.tensor_type_rules = self.tensor_type_rules.as_optional_ptr();
                 sd_ctx_params.n_threads = self.n_threads;
                 sd_ctx_params.wtype = self.weight_type;
                 sd_ctx_params.rng_type = self.rng;
@@ -1225,8 +1288,11 @@ impl ModelConfig {
                 sd_ctx_params.vae_format = self.vae_format;
                 sd_ctx_params.max_vram = max_vram.as_optional_ptr();
                 sd_ctx_params.stream_layers = self.stream_layers;
+                sd_ctx_params.eager_load = self.eager_load;
                 sd_ctx_params.backend = backend.as_optional_ptr();
                 sd_ctx_params.params_backend = params_backend.as_optional_ptr();
+                sd_ctx_params.split_mode = self.split_mode.as_optional_ptr();
+                sd_ctx_params.auto_fit = self.auto_fit;
                 sd_ctx_params.rpc_servers = self.rpc_servers.as_optional_ptr();
                 sd_ctx_params.model_args = model_args.as_ptr();
                 let ctx = new_sd_ctx(&sd_ctx_params);
@@ -1268,6 +1334,8 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .n_threads(value.n_threads)
             .max_vram(value.max_vram)
             .max_vram_spec(value.max_vram_spec.clone())
+            .stream_layers(value.stream_layers)
+            .eager_load(value.eager_load)
             .offload_params_to_cpu(value.offload_params_to_cpu)
             .upscale_repeats(value.upscale_repeats)
             .model(value.model.clone())
@@ -1288,6 +1356,7 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .pulid_weights(value.pulid_weights.clone())
             .pm_id_embed_path(value.pm_id_embed_path.clone())
             .weight_type(value.weight_type)
+            .tensor_type_rules(value.tensor_type_rules.clone())
             .high_noise_diffusion_model(value.high_noise_diffusion_model.clone())
             .vae_tiling(value.vae_tiling)
             .vae_tile_size(value.vae_tile_size)
@@ -1328,7 +1397,10 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .extra_sample_params(value.extra_sample_params.clone())
             .backend(value.backend.clone())
             .params_backend(value.params_backend.clone())
-            .rpc_servers(value.rpc_servers.clone());
+            .split_mode(value.split_mode.clone())
+            .auto_fit(value.auto_fit)
+            .rpc_servers(value.rpc_servers.clone())
+            .model_args(value.model_args.clone());
 
         builder.lora_models_internal(value.lora_models.clone());
 
@@ -1394,6 +1466,10 @@ pub struct Config {
     #[builder(default = "7.0")]
     cfg_scale: f32,
 
+    /// Image conditioning guidance scale. Non-finite values inherit cfg_scale.
+    #[builder(default = "f32::INFINITY")]
+    img_cfg_scale: f32,
+
     /// Distilled guidance scale for models with guidance input (default: 3.5)
     #[builder(default = "3.5")]
     guidance: f32,
@@ -1448,6 +1524,14 @@ pub struct Config {
     /// Number of images to generate (default: 1)
     #[builder(default = "1")]
     batch_count: i32,
+
+    /// Number of editable layers emitted by Qwen Image Layered models.
+    #[builder(default = "3")]
+    qwen_image_layers: i32,
+
+    /// Increase the reference-image index for each generated batch item.
+    #[builder(default = "false")]
+    increase_ref_index: bool,
 
     /// Ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
     /// <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x
@@ -1524,6 +1608,10 @@ pub struct VideoConfig {
     /// Unconditional guidance scale (default: 7.0)
     #[builder(default = "7.0")]
     cfg_scale: f32,
+
+    /// Image conditioning guidance scale. Non-finite values inherit cfg_scale.
+    #[builder(default = "f32::INFINITY")]
+    img_cfg_scale: f32,
 
     /// Distilled guidance scale for models with guidance input (default: 3.5)
     #[builder(default = "3.5")]
@@ -1605,6 +1693,10 @@ pub struct VideoConfig {
     #[builder(default = "7.0")]
     high_noise_cfg_scale: f32,
 
+    /// Image conditioning guidance scale for the high-noise phase.
+    #[builder(default = "f32::INFINITY")]
+    high_noise_img_cfg_scale: f32,
+
     /// Distilled guidance scale for the high-noise phase (default: 3.5)
     #[builder(default = "3.5")]
     high_noise_guidance: f32,
@@ -1624,6 +1716,22 @@ pub struct VideoConfig {
     /// High-noise SLG disabling point: (default: 0.2)
     #[builder(default = "0.2")]
     high_noise_skip_layer_end: f32,
+
+    /// Custom sigma values for the high-noise phase.
+    #[builder(default = "Default::default()")]
+    high_noise_sigmas: Vec<f32>,
+
+    /// Scheduler override for the high-noise phase; COUNT inherits the main scheduler.
+    #[builder(default = "Scheduler::SCHEDULER_COUNT")]
+    high_noise_scheduler: Scheduler,
+
+    /// Timestep shift override for the high-noise phase.
+    #[builder(default = "None")]
+    high_noise_timestep_shift: Option<i32>,
+
+    /// Flow shift override for the high-noise phase.
+    #[builder(default = "None")]
+    high_noise_flow_shift: Option<f32>,
 
     /// timestep boundary for Wan2.2 MoE model. (default: 0.875)
     #[builder(default = "0.875")]
@@ -1718,6 +1826,8 @@ impl ConfigBuilder {
         cache.spectrum_flex_window = params.flex;
         cache.spectrum_warmup_steps = params.warmup;
         cache.spectrum_stop_percent = params.stop;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1731,6 +1841,8 @@ impl ConfigBuilder {
         cache.error_decay_rate = params.decay;
         cache.use_relative_threshold = params.relative;
         cache.reset_error_on_compute = params.reset;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1741,6 +1853,8 @@ impl ConfigBuilder {
         cache.reuse_threshold = params.threshold;
         cache.start_percent = params.start;
         cache.end_percent = params.end;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1752,6 +1866,8 @@ impl ConfigBuilder {
         cache.Bn_compute_blocks = params.bn_blocks;
         cache.residual_diff_threshold = params.threshold;
         cache.max_warmup_steps = params.warmup;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         cache.scm_policy_dynamic = match params.scm_policy_dynamic {
             ScmPolicy::Static => false,
             ScmPolicy::Dynamic => true,
@@ -1761,8 +1877,18 @@ impl ConfigBuilder {
     }
 
     pub fn taylor_seer_caching(&mut self) -> &mut Self {
+        self.taylor_seer_caching_with_params(
+            TaylorSeerCacheParamsBuilder::default().build().unwrap(),
+        )
+    }
+
+    pub fn taylor_seer_caching_with_params(&mut self, params: TaylorSeerCacheParams) -> &mut Self {
         let (mut cache, mask) = Self::cache_init();
         cache.mode = sd_cache_mode_t::SD_CACHE_TAYLORSEER;
+        cache.taylorseer_n_derivatives = params.n_derivatives;
+        cache.taylorseer_skip_interval = params.skip_interval;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1864,6 +1990,8 @@ impl VideoConfigBuilder {
         cache.spectrum_flex_window = params.flex;
         cache.spectrum_warmup_steps = params.warmup;
         cache.spectrum_stop_percent = params.stop;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1877,6 +2005,8 @@ impl VideoConfigBuilder {
         cache.error_decay_rate = params.decay;
         cache.use_relative_threshold = params.relative;
         cache.reset_error_on_compute = params.reset;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1887,6 +2017,8 @@ impl VideoConfigBuilder {
         cache.reuse_threshold = params.threshold;
         cache.start_percent = params.start;
         cache.end_percent = params.end;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1898,6 +2030,8 @@ impl VideoConfigBuilder {
         cache.Bn_compute_blocks = params.bn_blocks;
         cache.residual_diff_threshold = params.threshold;
         cache.max_warmup_steps = params.warmup;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         cache.scm_policy_dynamic = match params.scm_policy_dynamic {
             ScmPolicy::Static => false,
             ScmPolicy::Dynamic => true,
@@ -1907,8 +2041,18 @@ impl VideoConfigBuilder {
     }
 
     pub fn taylor_seer_caching(&mut self) -> &mut Self {
+        self.taylor_seer_caching_with_params(
+            TaylorSeerCacheParamsBuilder::default().build().unwrap(),
+        )
+    }
+
+    pub fn taylor_seer_caching_with_params(&mut self, params: TaylorSeerCacheParams) -> &mut Self {
         let (mut cache, mask) = ConfigBuilder::cache_init();
         cache.mode = sd_cache_mode_t::SD_CACHE_TAYLORSEER;
+        cache.taylorseer_n_derivatives = params.n_derivatives;
+        cache.taylorseer_skip_interval = params.skip_interval;
+        cache.max_cached_steps = params.max_cached_steps;
+        cache.max_continuous_cached_steps = params.max_continuous_cached_steps;
         self.cache = Some((cache, mask));
         self
     }
@@ -1932,6 +2076,8 @@ impl From<&Config> for ConfigBuilder {
             .prompt(value.prompt.clone())
             .negative_prompt(value.negative_prompt.clone())
             .cfg_scale(value.cfg_scale)
+            .img_cfg_scale(value.img_cfg_scale)
+            .guidance(value.guidance)
             .strength(value.strength)
             .pm_style_strength(value.pm_style_strength)
             .pulid_id_embedding(value.pulid_id_embedding.clone())
@@ -1943,6 +2089,8 @@ impl From<&Config> for ConfigBuilder {
             .steps(value.steps)
             .seed(value.seed)
             .batch_count(value.batch_count)
+            .qwen_image_layers(value.qwen_image_layers)
+            .increase_ref_index(value.increase_ref_index)
             .clip_skip(value.clip_skip)
             .slg_scale(value.slg_scale)
             .skip_layer(value.skip_layer.clone())
@@ -1975,6 +2123,7 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .prompt(value.prompt)
             .negative_prompt(value.negative_prompt)
             .cfg_scale(value.cfg_scale)
+            .img_cfg_scale(value.img_cfg_scale)
             .guidance(value.guidance)
             .strength(value.strength)
             .height(value.height)
@@ -1995,11 +2144,14 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .high_noise_eta(value.high_noise_eta)
             .high_noise_extra_sample_params(value.high_noise_extra_sample_params)
             .high_noise_cfg_scale(value.high_noise_cfg_scale)
+            .high_noise_img_cfg_scale(value.high_noise_img_cfg_scale)
             .high_noise_guidance(value.high_noise_guidance)
             .high_noise_slg_scale(value.high_noise_slg_scale)
             .high_noise_skip_layer(value.high_noise_skip_layer)
             .high_noise_skip_layer_start(value.high_noise_skip_layer_start)
             .high_noise_skip_layer_end(value.high_noise_skip_layer_end)
+            .high_noise_sigmas(value.high_noise_sigmas)
+            .high_noise_scheduler(value.high_noise_scheduler)
             .moe_boundary(value.moe_boundary)
             .vace_strength(value.vace_strength)
             .preview_mode(value.preview_mode)
@@ -2011,6 +2163,12 @@ impl From<VideoConfig> for VideoConfigBuilder {
                 hires_path.as_deref(),
             )
             .cache(value.cache.clone());
+        if let Some(timestep_shift) = value.high_noise_timestep_shift {
+            builder.high_noise_timestep_shift(timestep_shift);
+        }
+        if let Some(flow_shift) = value.high_noise_flow_shift {
+            builder.high_noise_flow_shift(flow_shift);
+        }
         builder
     }
 }
@@ -2059,6 +2217,14 @@ fn prepend_backend_assignment(base: &CLibString, assignments: &[&str]) -> CLibSt
         .collect();
     if !base.is_empty() {
         parts.push(base.to_string_lossy());
+    }
+    CLibString::from(parts.join(","))
+}
+
+fn append_key_value_args(defaults: &[String], overrides: &CLibString) -> CLibString {
+    let mut parts = defaults.to_vec();
+    if !overrides.is_empty() {
+        parts.push(overrides.to_string_lossy());
     }
     CLibString::from(parts.join(","))
 }
@@ -2133,6 +2299,7 @@ fn load_rgb_image(source: &InputImage) -> Result<RgbImage, DiffusionError> {
 
 fn make_guidance(
     cfg_scale: f32,
+    img_cfg_scale: f32,
     guidance: f32,
     slg_scale: f32,
     layers: &mut [i32],
@@ -2141,7 +2308,7 @@ fn make_guidance(
 ) -> sd_guidance_params_t {
     sd_guidance_params_t {
         txt_cfg: cfg_scale,
-        img_cfg: cfg_scale,
+        img_cfg: img_cfg_scale,
         distilled_guidance: guidance,
         slg: sd_slg_params_t {
             layers: layers.as_mut_ptr(),
@@ -2196,7 +2363,9 @@ unsafe fn owned_native_string(ptr: *mut c_char) -> Result<String, DiffusionError
         return Err(DiffusionError::NativeString);
     }
 
-    let result = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+    let result = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
     unsafe {
         libc_free(ptr.cast());
     }
@@ -2433,7 +2602,7 @@ fn gen_img_maybe_progress(
         let mut layers = config.skip_layer.clone();
         let guidance = sd_guidance_params_t {
             txt_cfg: config.cfg_scale,
-            img_cfg: config.cfg_scale,
+            img_cfg: config.img_cfg_scale,
             distilled_guidance: config.guidance,
             slg: sd_slg_params_t {
                 layers: layers.as_mut_ptr(),
@@ -2691,7 +2860,6 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.init_image = init_image;
         sd_img_gen_params.ref_images = ref_image_ptr;
         sd_img_gen_params.ref_images_count = num_ref_images as i32;
-        sd_img_gen_params.increase_ref_index = false;
         sd_img_gen_params.mask_image = mask_image;
         sd_img_gen_params.width = config.width;
         sd_img_gen_params.height = config.height;
@@ -2699,6 +2867,8 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.strength = config.strength;
         sd_img_gen_params.seed = config.seed;
         sd_img_gen_params.batch_count = config.batch_count;
+        sd_img_gen_params.qwen_image_layers = config.qwen_image_layers;
+        sd_img_gen_params.increase_ref_index = config.increase_ref_index;
         sd_img_gen_params.control_image = control_image;
         sd_img_gen_params.control_strength = config.control_strength;
         sd_img_gen_params.pm_params = pm_params;
@@ -2759,14 +2929,13 @@ fn gen_img_maybe_progress(
                 for img in image_slices.iter().take(completed_images) {
                     match upscale(model_config.upscale_repeats, upscaler_ctx, *img) {
                         Ok(upscaled) => {
-                            let _ = image_from_sd_image(upscaled.as_image())
-                                .and_then(|img| {
-                                    ext_sender
-                                        .as_ref()
-                                        .unwrap()
-                                        .send(ExtProgress::FinalImage(img))
-                                        .ok()
-                                });
+                            let _ = image_from_sd_image(upscaled.as_image()).and_then(|img| {
+                                ext_sender
+                                    .as_ref()
+                                    .unwrap()
+                                    .send(ExtProgress::FinalImage(img))
+                                    .ok()
+                            });
                         }
                         Err(err) => {
                             return Err(err);
@@ -2837,6 +3006,7 @@ fn gen_video_maybe_progress(
         let mut layers = config.skip_layer.clone();
         let guidance = make_guidance(
             config.cfg_scale,
+            config.img_cfg_scale,
             config.guidance,
             config.slg_scale,
             &mut layers,
@@ -2846,6 +3016,7 @@ fn gen_video_maybe_progress(
         let mut high_noise_layers = config.high_noise_skip_layer.clone();
         let high_noise_guidance = make_guidance(
             config.high_noise_cfg_scale,
+            config.high_noise_img_cfg_scale,
             config.high_noise_guidance,
             config.high_noise_slg_scale,
             &mut high_noise_layers,
@@ -2869,6 +3040,12 @@ fn gen_video_maybe_progress(
         } else {
             model_config.scheduler
         };
+        let high_noise_scheduler = if config.high_noise_scheduler == Scheduler::SCHEDULER_COUNT {
+            scheduler
+        } else {
+            config.high_noise_scheduler
+        };
+        let mut high_noise_sigmas = config.high_noise_sigmas.clone();
 
         let sample_params = sd_sample_params_t {
             guidance,
@@ -2887,11 +3064,15 @@ fn gen_video_maybe_progress(
             sample_method: high_noise_sample_method,
             sample_steps: config.high_noise_steps,
             eta: config.high_noise_eta,
-            scheduler,
-            shifted_timestep: model_config.timestep_shift,
-            custom_sigmas: null_mut(),
-            custom_sigmas_count: 0,
-            flow_shift: model_config.flow_shift,
+            scheduler: high_noise_scheduler,
+            shifted_timestep: config
+                .high_noise_timestep_shift
+                .unwrap_or(model_config.timestep_shift),
+            custom_sigmas: high_noise_sigmas.as_mut_ptr(),
+            custom_sigmas_count: high_noise_sigmas.len() as i32,
+            flow_shift: config
+                .high_noise_flow_shift
+                .unwrap_or(model_config.flow_shift),
             extra_sample_args: config.high_noise_extra_sample_params.as_optional_ptr(),
         };
         let vae_tiling_params = sd_tiling_params_t {
@@ -3123,8 +3304,9 @@ mod tests {
 
     use super::{
         AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
-        SampleMethod, Scheduler, Upscaler, VideoConfigBuilder, audio_from_sd_audio,
-        final_video_progress, gen_img, image_from_sd_image, images_from_sd_frames,
+        SampleMethod, Scheduler, TaylorSeerCacheParamsBuilder, Upscaler, VideoConfigBuilder,
+        audio_from_sd_audio, final_video_progress, gen_img, image_from_sd_image,
+        images_from_sd_frames,
     };
 
     #[test]
@@ -3238,6 +3420,11 @@ mod tests {
             .extra_sample_params("{\"sample\":true}")
             .backend("cpu")
             .params_backend("cpu")
+            .eager_load(true)
+            .tensor_type_rules("vae=f16")
+            .split_mode("diffusion=row")
+            .auto_fit(true)
+            .model_args("custom_arg=true")
             .rpc_servers("127.0.0.1:50052")
             .max_vram_spec("cuda=8,cpu=0")
             .hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires.clone(), None)
@@ -3267,6 +3454,17 @@ mod tests {
         );
         assert_eq!(model_config.backend.0.to_str().unwrap(), "cpu");
         assert_eq!(model_config.params_backend.0.to_str().unwrap(), "cpu");
+        assert!(model_config.eager_load);
+        assert!(model_config.auto_fit);
+        assert_eq!(
+            model_config.tensor_type_rules.0.to_str().unwrap(),
+            "vae=f16"
+        );
+        assert_eq!(model_config.split_mode.0.to_str().unwrap(), "diffusion=row");
+        assert_eq!(
+            model_config.model_args.0.to_str().unwrap(),
+            "custom_arg=true"
+        );
         assert_eq!(
             model_config.rpc_servers.0.to_str().unwrap(),
             "127.0.0.1:50052"
@@ -3281,10 +3479,18 @@ mod tests {
             .prompt("a lovely cat driving a sport car")
             .fps(24)
             .high_noise_extra_sample_params("{\"high_noise\":true}")
+            .img_cfg_scale(2.0)
+            .high_noise_img_cfg_scale(1.5)
+            .high_noise_sigmas(vec![1.0, 0.25])
+            .high_noise_scheduler(Scheduler::KARRAS_SCHEDULER)
+            .high_noise_timestep_shift(42)
+            .high_noise_flow_shift(3.0)
             .video_hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires, None)
             .build()
             .unwrap();
         assert_eq!(video_config.fps, 24);
+        assert_eq!(video_config.img_cfg_scale, 2.0);
+        assert_eq!(video_config.high_noise_sigmas, vec![1.0, 0.25]);
         assert_eq!(
             video_config
                 .high_noise_extra_sample_params
@@ -3297,12 +3503,17 @@ mod tests {
 
         let rebuilt = VideoConfigBuilder::from(video_config).build().unwrap();
         assert_eq!(rebuilt.fps, 24);
+        assert_eq!(rebuilt.high_noise_timestep_shift, Some(42));
+        assert_eq!(rebuilt.high_noise_flow_shift, Some(3.0));
         assert_eq!(rebuilt.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
 
         let image_config = ConfigBuilder::default()
             .prompt("a lovely cat driving a sport car")
             .pulid_id_embedding(PathBuf::from("./pulid-id.safetensors"))
             .pulid_id_weight(0.75)
+            .img_cfg_scale(2.5)
+            .qwen_image_layers(5)
+            .increase_ref_index(true)
             .build()
             .unwrap();
         assert_eq!(
@@ -3310,6 +3521,24 @@ mod tests {
             PathBuf::from("./pulid-id.safetensors")
         );
         assert_eq!(image_config.pulid_id_weight, 0.75);
+        assert_eq!(image_config.img_cfg_scale, 2.5);
+        assert_eq!(image_config.qwen_image_layers, 5);
+        assert!(image_config.increase_ref_index);
+
+        let taylor = TaylorSeerCacheParamsBuilder::default()
+            .n_derivatives(3)
+            .skip_interval(2)
+            .max_cached_steps(10)
+            .max_continuous_cached_steps(4)
+            .build()
+            .unwrap();
+        let cached = ConfigBuilder::default()
+            .prompt("cache")
+            .taylor_seer_caching_with_params(taylor)
+            .build()
+            .unwrap();
+        assert_eq!(cached.cache.0.taylorseer_n_derivatives, 3);
+        assert_eq!(cached.cache.0.max_cached_steps, 10);
     }
 
     #[test]
