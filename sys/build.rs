@@ -81,6 +81,7 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("SD_WEBP", "OFF")
         .define("SD_WEBM", "OFF")
+        .define("GGML_VK_FORCE_MAX_ALLOCATION_SIZE", "1073741824")
         .very_verbose(true)
         .pic(true);
 
@@ -161,7 +162,9 @@ fn main() {
         println!("cargo:rustc-link-search={}", hip_lib_path.display());
 
         config.define("SD_HIPBLAS", "ON");
-        if let Ok(target) = env::var("GFX_NAME") {
+        if let Ok(target) = env::var("GFX_NAME").or_else(|_| Ok("gfx1100"))
+        //default to gfx1100 if GFX_NAME is not set
+        {
             config.define("AMDGPU_TARGETS", &target);
             config.define("GPU_TARGETS", target);
         }
