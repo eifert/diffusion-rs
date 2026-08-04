@@ -162,7 +162,7 @@ fn main() {
         println!("cargo:rustc-link-search={}", hip_lib_path.display());
 
         config.define("SD_HIPBLAS", "ON");
-        if let Ok(target) = env::var("GFX_NAME").or_else(|_| Ok("gfx1100"))
+        if let Ok::<std::string::String, std::env::VarError>(target) = env::var("GFX_NAME").or_else(|_| Ok("gfx1100".to_string()))
         //default to gfx1100 if GFX_NAME is not set
         {
             config.define("AMDGPU_TARGETS", &target);
