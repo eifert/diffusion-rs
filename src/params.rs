@@ -133,8 +133,6 @@ pub struct ImageParams {
     pub eta: Option<f32>,
     pub control_strength: Option<f32>,
     pub qwen_image_layers: Option<i32>,
-    pub increase_ref_index: Option<bool>,
-    pub disable_auto_resize_ref_image: Option<bool>,
 }
 
 impl TryFrom<ImageParams> for Config {
@@ -175,8 +173,6 @@ impl TryFrom<ImageParams> for Config {
         set!(eta);
         set!(control_strength);
         set!(qwen_image_layers);
-        set!(increase_ref_index);
-        set!(disable_auto_resize_ref_image);
         b.build()
     }
 }

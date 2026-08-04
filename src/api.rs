@@ -44,6 +44,7 @@ use diffusion_rs_sys::sd_log_level_t;
 use diffusion_rs_sys::sd_lora_t;
 use diffusion_rs_sys::sd_pm_params_t;
 use diffusion_rs_sys::sd_pulid_params_t;
+use diffusion_rs_sys::sd_ref_video_t;
 use diffusion_rs_sys::sd_sample_method_name;
 use diffusion_rs_sys::sd_sample_params_t;
 use diffusion_rs_sys::sd_scheduler_name;
@@ -118,6 +119,7 @@ const SAMPLE_METHODS: [SampleMethod; SampleMethod::SAMPLE_METHOD_COUNT as usize]
     SampleMethod::EULER_GE_SAMPLE_METHOD,
     SampleMethod::DPMPP2M_SDE_SAMPLE_METHOD,
     SampleMethod::DPMPP2M_SDE_BT_SAMPLE_METHOD,
+    SampleMethod::LMS_SAMPLE_METHOD,
 ];
 const SCHEDULERS: [Scheduler; Scheduler::SCHEDULER_COUNT as usize] = [
     Scheduler::DISCRETE_SCHEDULER,
@@ -158,7 +160,8 @@ const _: [(); 16] = [(); SampleMethod::EULER_A_CFG_PP_SAMPLE_METHOD as usize];
 const _: [(); 17] = [(); SampleMethod::EULER_GE_SAMPLE_METHOD as usize];
 const _: [(); 18] = [(); SampleMethod::DPMPP2M_SDE_SAMPLE_METHOD as usize];
 const _: [(); 19] = [(); SampleMethod::DPMPP2M_SDE_BT_SAMPLE_METHOD as usize];
-const _: [(); 20] = [(); SampleMethod::SAMPLE_METHOD_COUNT as usize];
+const _: [(); 20] = [(); SampleMethod::LMS_SAMPLE_METHOD as usize];
+const _: [(); 21] = [(); SampleMethod::SAMPLE_METHOD_COUNT as usize];
 const _: [(); 0] = [(); Scheduler::DISCRETE_SCHEDULER as usize];
 const _: [(); 1] = [(); Scheduler::KARRAS_SCHEDULER as usize];
 const _: [(); 2] = [(); Scheduler::EXPONENTIAL_SCHEDULER as usize];
@@ -436,6 +439,14 @@ pub struct AudioBuffer {
 }
 
 #[allow(unused)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Video{
+    pub frames: Vec<InputImage>,
+    pub fps: i32,
+    pub audio: Option<AudioBuffer>,
+}
+
+#[allow(unused)]
 #[derive(Debug)]
 pub enum ExtProgress {
     Progress(Progress),
@@ -480,7 +491,7 @@ pub enum ClipSkip {
     OneLayer = 2,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 /// Image source used by generation configs
 pub enum InputImage {
     Path(PathBuf),
@@ -1529,10 +1540,6 @@ pub struct Config {
     #[builder(default = "3")]
     qwen_image_layers: i32,
 
-    /// Increase the reference-image index for each generated batch item.
-    #[builder(default = "false")]
-    increase_ref_index: bool,
-
     /// Ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
     /// <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x
     #[builder(default = "ClipSkip::Unspecified")]
@@ -1559,10 +1566,6 @@ pub struct Config {
     #[builder(default = "0.2")]
     skip_layer_end: f32,
 
-    /// Disable auto resize of ref images
-    #[builder(default = "false")]
-    disable_auto_resize_ref_image: bool,
-
     #[builder(default = "Self::cache_init()", private)]
     cache: (sd_cache_params_t, Option<CLibString>),
 }
@@ -1581,6 +1584,15 @@ pub struct VideoConfig {
     /// Path to the ending image, required by some video models
     #[builder(default = "Default::default()")]
     end_img: InputImage,
+
+    #[builder(default = "Default::default()")]
+    ref_images: Vec<InputImage>,
+
+    #[builder(default = "Default::default()")]
+    ref_videos: Vec<Video>,
+
+    #[builder(default = "Default::default()")]
+    ref_audios: Vec<AudioBuffer>,
 
     /// Paths to control video frames
     #[builder(default = "Default::default()", setter(custom))]
@@ -2090,14 +2102,12 @@ impl From<&Config> for ConfigBuilder {
             .seed(value.seed)
             .batch_count(value.batch_count)
             .qwen_image_layers(value.qwen_image_layers)
-            .increase_ref_index(value.increase_ref_index)
             .clip_skip(value.clip_skip)
             .slg_scale(value.slg_scale)
             .skip_layer(value.skip_layer.clone())
             .skip_layer_start(value.skip_layer_start)
             .skip_layer_end(value.skip_layer_end)
             .canny(value.canny)
-            .disable_auto_resize_ref_image(value.disable_auto_resize_ref_image)
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
@@ -2295,6 +2305,102 @@ fn load_rgb_image(source: &InputImage) -> Result<RgbImage, DiffusionError> {
         InputImage::Path(path) => Ok(image::open(path)?.to_rgb8()),
         InputImage::Image(image) => Ok(image.clone()),
     }
+}
+
+/// Prepare reference images for the C API by loading them and converting to sd_image_t.
+/// Returns a tuple of (Vec<sd_image_t>, Vec<Vec<u8>>) where the second element
+/// holds the pixel data to keep it alive for the lifetime of the sd_image_t pointers.
+fn prepare_ref_images(
+    ref_images: &[InputImage],
+) -> Result<(Vec<sd_image_t>, Vec<Vec<u8>>), DiffusionError> {
+    let mut ref_image_list = Vec::new();
+    let mut ref_pixel_storage = Vec::new();
+    for ref_image in ref_images {
+        let img = load_rgb_image(ref_image)?;
+        let (width, height) = img.dimensions();
+        let image_data = img.into_raw();
+
+        ref_pixel_storage.push(image_data);
+        let storage_ref = ref_pixel_storage.last_mut().unwrap();
+        ref_image_list.push(sd_image_t {
+            width,
+            height,
+            channel: 3,
+            data: storage_ref.as_mut_ptr(),
+        });
+    }
+    Ok((ref_image_list, ref_pixel_storage))
+}
+
+fn native_audio(audio: &AudioBuffer) -> sd_audio_t {
+    let sample_count = if audio.channels == 0 {
+        0
+    } else {
+        audio.samples.len() / audio.channels as usize
+    };
+    sd_audio_t {
+        sample_rate: audio.sample_rate,
+        channels: audio.channels,
+        sample_count: sample_count as u64,
+        data: if audio.samples.is_empty() {
+            null_mut()
+        } else {
+            audio.samples.as_ptr().cast_mut()
+        },
+    }
+}
+
+fn prepare_ref_videos(
+    videos: &[Video],
+) -> Result<(
+    Vec<sd_ref_video_t>,
+    Vec<Vec<sd_image_t>>,
+    Vec<Vec<Vec<u8>>>,
+), DiffusionError> {
+    let mut frame_views_storage = Vec::with_capacity(videos.len());
+    let mut pixel_storage = Vec::with_capacity(videos.len());
+    let mut native_videos = Vec::with_capacity(videos.len());
+
+    for video in videos {
+        let mut frame_views = Vec::with_capacity(video.frames.len());
+        let mut video_pixels = Vec::with_capacity(video.frames.len());
+        for frame in &video.frames {
+            let image = load_rgb_image(frame)?;
+            let (width, height) = image.dimensions();
+            video_pixels.push(image.into_raw());
+            let pixels = video_pixels.last_mut().unwrap();
+            frame_views.push(sd_image_t {
+                width,
+                height,
+                channel: 3,
+                data: pixels.as_mut_ptr(),
+            });
+        }
+
+        let audio = video.audio.as_ref().map_or(
+            sd_audio_t {
+                sample_rate: 0,
+                channels: 0,
+                sample_count: 0,
+                data: null_mut(),
+            },
+            native_audio,
+        );
+        native_videos.push(sd_ref_video_t {
+            frames: if frame_views.is_empty() {
+                null_mut()
+            } else {
+                frame_views.as_mut_ptr()
+            },
+            frame_count: frame_views.len() as i32,
+            fps: video.fps,
+            audio,
+        });
+        frame_views_storage.push(frame_views);
+        pixel_storage.push(video_pixels);
+    }
+
+    Ok((native_videos, frame_views_storage, pixel_storage))
 }
 
 fn make_guidance(
@@ -2708,23 +2814,7 @@ fn gen_img_maybe_progress(
             }
         }
 
-        let mut ref_image_list = Vec::new();
-        let mut ref_pixel_storage = Vec::new();
-        for ref_image in &config.ref_images {
-            let img = load_rgb_image(ref_image)?;
-            let (width, height) = img.dimensions();
-            let image_data = img.into_raw();
-
-            ref_pixel_storage.push(image_data);
-            let storage_ref = ref_pixel_storage.last_mut().unwrap();
-            ref_image_list.push(sd_image_t {
-                width,
-                height,
-                channel: 3,
-                data: storage_ref.as_mut_ptr(),
-            });
-        }
-
+        let (mut ref_image_list, _ref_pixel_storage) = prepare_ref_images(&config.ref_images)?;
         let num_ref_images = ref_image_list.len();
         let ref_image_ptr = if num_ref_images > 0 {
             ref_image_list.as_mut_ptr()
@@ -2868,13 +2958,11 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.seed = config.seed;
         sd_img_gen_params.batch_count = config.batch_count;
         sd_img_gen_params.qwen_image_layers = config.qwen_image_layers;
-        sd_img_gen_params.increase_ref_index = config.increase_ref_index;
         sd_img_gen_params.control_image = control_image;
         sd_img_gen_params.control_strength = config.control_strength;
         sd_img_gen_params.pm_params = pm_params;
         sd_img_gen_params.pulid_params = pulid_params;
         sd_img_gen_params.vae_tiling_params = vae_tiling_params;
-        sd_img_gen_params.auto_resize_ref_image = !config.disable_auto_resize_ref_image;
         sd_img_gen_params.cache = cache;
         sd_img_gen_params.loras = loras.as_ptr();
         sd_img_gen_params.lora_count = loras.len() as u32;
@@ -3090,6 +3178,10 @@ fn gen_video_maybe_progress(
         let mut _end_buffer: Option<Vec<u8>> = None;
         let mut control_frame_storage: Vec<Vec<u8>> = Vec::new();
         let mut control_frames: Vec<sd_image_t> = Vec::new();
+        let (mut native_ref_videos, _ref_video_frames, _ref_video_pixel_storage) =
+            prepare_ref_videos(&config.ref_videos)?;
+        let mut native_ref_audios: Vec<sd_audio_t> =
+            config.ref_audios.iter().map(native_audio).collect();
 
         if has_init_image {
             let img = load_rgb_image(&config.init_img)?;
@@ -3205,6 +3297,14 @@ fn gen_video_maybe_progress(
             })
             .collect();
 
+        let (mut ref_image_list, _ref_pixel_storage) = prepare_ref_images(&config.ref_images)?;
+        let num_ref_images = ref_image_list.len();
+        let ref_image_ptr = if num_ref_images > 0 {
+            ref_image_list.as_mut_ptr()
+        } else {
+            null_mut()
+        };
+
         let mut cache = config.cache.0;
         if let Some(scm_mask) = &config.cache.1 {
             cache.scm_mask = scm_mask.as_ptr();
@@ -3226,6 +3326,20 @@ fn gen_video_maybe_progress(
             clip_skip: config.clip_skip as i32,
             init_image,
             end_image,
+            ref_images: ref_image_ptr,
+            ref_images_count: num_ref_images as i32,
+            ref_videos: if native_ref_videos.is_empty() {
+                null_mut()
+            } else {
+                native_ref_videos.as_mut_ptr()
+            },
+            ref_videos_count: native_ref_videos.len() as i32,
+            ref_audios: if native_ref_audios.is_empty() {
+                null_mut()
+            } else {
+                native_ref_audios.as_mut_ptr()
+            },
+            ref_audios_count: native_ref_audios.len() as i32,
             control_frames: control_frames.as_mut_ptr(),
             control_frames_size: control_frames.len() as i32,
             width: config.width,
