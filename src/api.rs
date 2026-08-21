@@ -53,6 +53,7 @@ use diffusion_rs_sys::sd_set_preview_callback;
 use diffusion_rs_sys::sd_set_progress_callback;
 use diffusion_rs_sys::sd_slg_params_t;
 use diffusion_rs_sys::sd_tiling_params_t;
+use diffusion_rs_sys::sd_type_name;
 use diffusion_rs_sys::sd_vae_format_t;
 use diffusion_rs_sys::sd_vid_gen_params_t;
 use diffusion_rs_sys::upscaler_ctx_t;
@@ -139,6 +140,43 @@ const SCHEDULERS: [Scheduler; Scheduler::SCHEDULER_COUNT as usize] = [
     Scheduler::FLUX_SCHEDULER,
     Scheduler::BETA_SCHEDULER,
 ];
+// The sd_type_t enum has gaps in its discriminants, so the list is shorter than SD_TYPE_COUNT.
+const WEIGHT_TYPES: [WeightType; 34] = [
+    WeightType::SD_TYPE_F32,
+    WeightType::SD_TYPE_F16,
+    WeightType::SD_TYPE_Q4_0,
+    WeightType::SD_TYPE_Q4_1,
+    WeightType::SD_TYPE_Q5_0,
+    WeightType::SD_TYPE_Q5_1,
+    WeightType::SD_TYPE_Q8_0,
+    WeightType::SD_TYPE_Q8_1,
+    WeightType::SD_TYPE_Q2_K,
+    WeightType::SD_TYPE_Q3_K,
+    WeightType::SD_TYPE_Q4_K,
+    WeightType::SD_TYPE_Q5_K,
+    WeightType::SD_TYPE_Q6_K,
+    WeightType::SD_TYPE_Q8_K,
+    WeightType::SD_TYPE_IQ2_XXS,
+    WeightType::SD_TYPE_IQ2_XS,
+    WeightType::SD_TYPE_IQ3_XXS,
+    WeightType::SD_TYPE_IQ1_S,
+    WeightType::SD_TYPE_IQ4_NL,
+    WeightType::SD_TYPE_IQ3_S,
+    WeightType::SD_TYPE_IQ2_S,
+    WeightType::SD_TYPE_IQ4_XS,
+    WeightType::SD_TYPE_I8,
+    WeightType::SD_TYPE_I16,
+    WeightType::SD_TYPE_I32,
+    WeightType::SD_TYPE_I64,
+    WeightType::SD_TYPE_F64,
+    WeightType::SD_TYPE_IQ1_M,
+    WeightType::SD_TYPE_BF16,
+    WeightType::SD_TYPE_TQ1_0,
+    WeightType::SD_TYPE_TQ2_0,
+    WeightType::SD_TYPE_MXFP4,
+    WeightType::SD_TYPE_NVFP4,
+    WeightType::SD_TYPE_Q1_0,
+];
 // Keep these assertions in sync with stable-diffusion.cpp so enum drift fails the build.
 const _: [(); 0] = [(); SampleMethod::EULER_SAMPLE_METHOD as usize];
 const _: [(); 1] = [(); SampleMethod::EULER_A_SAMPLE_METHOD as usize];
@@ -179,10 +217,46 @@ const _: [(); 13] = [(); Scheduler::FLUX2_SCHEDULER as usize];
 const _: [(); 14] = [(); Scheduler::FLUX_SCHEDULER as usize];
 const _: [(); 15] = [(); Scheduler::BETA_SCHEDULER as usize];
 const _: [(); 16] = [(); Scheduler::SCHEDULER_COUNT as usize];
+const _: [(); 0] = [(); WeightType::SD_TYPE_F32 as usize];
+const _: [(); 1] = [(); WeightType::SD_TYPE_F16 as usize];
+const _: [(); 2] = [(); WeightType::SD_TYPE_Q4_0 as usize];
+const _: [(); 3] = [(); WeightType::SD_TYPE_Q4_1 as usize];
+const _: [(); 6] = [(); WeightType::SD_TYPE_Q5_0 as usize];
+const _: [(); 7] = [(); WeightType::SD_TYPE_Q5_1 as usize];
+const _: [(); 8] = [(); WeightType::SD_TYPE_Q8_0 as usize];
+const _: [(); 9] = [(); WeightType::SD_TYPE_Q8_1 as usize];
+const _: [(); 10] = [(); WeightType::SD_TYPE_Q2_K as usize];
+const _: [(); 11] = [(); WeightType::SD_TYPE_Q3_K as usize];
+const _: [(); 12] = [(); WeightType::SD_TYPE_Q4_K as usize];
+const _: [(); 13] = [(); WeightType::SD_TYPE_Q5_K as usize];
+const _: [(); 14] = [(); WeightType::SD_TYPE_Q6_K as usize];
+const _: [(); 15] = [(); WeightType::SD_TYPE_Q8_K as usize];
+const _: [(); 16] = [(); WeightType::SD_TYPE_IQ2_XXS as usize];
+const _: [(); 17] = [(); WeightType::SD_TYPE_IQ2_XS as usize];
+const _: [(); 18] = [(); WeightType::SD_TYPE_IQ3_XXS as usize];
+const _: [(); 19] = [(); WeightType::SD_TYPE_IQ1_S as usize];
+const _: [(); 20] = [(); WeightType::SD_TYPE_IQ4_NL as usize];
+const _: [(); 21] = [(); WeightType::SD_TYPE_IQ3_S as usize];
+const _: [(); 22] = [(); WeightType::SD_TYPE_IQ2_S as usize];
+const _: [(); 23] = [(); WeightType::SD_TYPE_IQ4_XS as usize];
+const _: [(); 24] = [(); WeightType::SD_TYPE_I8 as usize];
+const _: [(); 25] = [(); WeightType::SD_TYPE_I16 as usize];
+const _: [(); 26] = [(); WeightType::SD_TYPE_I32 as usize];
+const _: [(); 27] = [(); WeightType::SD_TYPE_I64 as usize];
+const _: [(); 28] = [(); WeightType::SD_TYPE_F64 as usize];
+const _: [(); 29] = [(); WeightType::SD_TYPE_IQ1_M as usize];
+const _: [(); 30] = [(); WeightType::SD_TYPE_BF16 as usize];
+const _: [(); 34] = [(); WeightType::SD_TYPE_TQ1_0 as usize];
+const _: [(); 35] = [(); WeightType::SD_TYPE_TQ2_0 as usize];
+const _: [(); 39] = [(); WeightType::SD_TYPE_MXFP4 as usize];
+const _: [(); 40] = [(); WeightType::SD_TYPE_NVFP4 as usize];
+const _: [(); 41] = [(); WeightType::SD_TYPE_Q1_0 as usize];
+const _: [(); 42] = [(); WeightType::SD_TYPE_COUNT as usize];
 type SdLogger = dyn Fn(LogLevel, &str) + Send + Sync + 'static;
 static SD_LOGGER: OnceLock<RwLock<Option<Arc<SdLogger>>>> = OnceLock::new();
 static SAMPLER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 static SCHEDULER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+static WEIGHT_TYPE_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
 fn sd_logger() -> &'static RwLock<Option<Arc<SdLogger>>> {
     SD_LOGGER.get_or_init(|| RwLock::new(None))
@@ -208,6 +282,32 @@ fn native_scheduler_name(scheduler: Scheduler) -> Option<String> {
     native_name(unsafe { sd_scheduler_name(scheduler) })
 }
 
+fn native_weight_type_name(weight_type: WeightType) -> Option<String> {
+    native_name(unsafe { sd_type_name(weight_type) })
+}
+
+/// Return the stable-diffusion.cpp name for a weight type.
+pub fn weight_type_name(weight_type: WeightType) -> Option<&'static str> {
+    WEIGHT_TYPES
+        .iter()
+        .position(|candidate| *candidate == weight_type)
+        .and_then(|index| weight_type_names().get(index))
+        .map(String::as_str)
+}
+
+/// Return all weight type names exposed by stable-diffusion.cpp.
+pub fn weight_type_names() -> &'static [String] {
+    WEIGHT_TYPE_NAMES.get_or_init(|| {
+        WEIGHT_TYPES
+            .iter()
+            .map(|weight_type| {
+                native_weight_type_name(*weight_type)
+                    .expect("stable-diffusion.cpp returned a null weight type name")
+            })
+            .collect()
+    })
+}
+
 /// Return the stable-diffusion.cpp name for a sampler.
 pub fn sampler_name(sample_method: SampleMethod) -> Option<&'static str> {
     SAMPLE_METHODS
@@ -215,6 +315,33 @@ pub fn sampler_name(sample_method: SampleMethod) -> Option<&'static str> {
         .position(|candidate| *candidate == sample_method)
         .and_then(|index| sampler_names().get(index))
         .map(String::as_str)
+}
+
+/// Look up a sampler by its stable-diffusion.cpp name (case-insensitive).
+pub fn sampler_from_name(name: &str) -> Option<SampleMethod> {
+    let name = name.to_ascii_lowercase();
+    sampler_names()
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(&name))
+        .map(|index| SAMPLE_METHODS[index])
+}
+
+/// Look up a scheduler by its stable-diffusion.cpp name (case-insensitive).
+pub fn scheduler_from_name(name: &str) -> Option<Scheduler> {
+    let name = name.to_ascii_lowercase();
+    scheduler_names()
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(&name))
+        .map(|index| SCHEDULERS[index])
+}
+
+/// Look up a weight type by its stable-diffusion.cpp name (case-insensitive).
+pub fn weight_type_from_name(name: &str) -> Option<WeightType> {
+    let name = name.to_ascii_lowercase();
+    weight_type_names()
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(&name))
+        .map(|index| WEIGHT_TYPES[index])
 }
 
 /// Return the stable-diffusion.cpp name for a scheduler.
@@ -440,7 +567,7 @@ pub struct AudioBuffer {
 
 #[allow(unused)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct Video{
+pub struct Video {
     pub frames: Vec<InputImage>,
     pub fps: i32,
     pub audio: Option<AudioBuffer>,
@@ -2352,11 +2479,7 @@ fn native_audio(audio: &AudioBuffer) -> sd_audio_t {
 
 fn prepare_ref_videos(
     videos: &[Video],
-) -> Result<(
-    Vec<sd_ref_video_t>,
-    Vec<Vec<sd_image_t>>,
-    Vec<Vec<Vec<u8>>>,
-), DiffusionError> {
+) -> Result<(Vec<sd_ref_video_t>, Vec<Vec<sd_image_t>>, Vec<Vec<Vec<u8>>>), DiffusionError> {
     let mut frame_views_storage = Vec::with_capacity(videos.len());
     let mut pixel_storage = Vec::with_capacity(videos.len());
     let mut native_videos = Vec::with_capacity(videos.len());
