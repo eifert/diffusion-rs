@@ -3716,12 +3716,12 @@ mod tests {
             .prompt("a lovely cat driving a sport car")
             .fps(24)
             .high_noise_extra_sample_params("{\"high_noise\":true}")
-            .img_cfg_scale(2.0)
-            .high_noise_img_cfg_scale(1.5)
+            .img_cfg_scale(2.0_f32)
+            .high_noise_img_cfg_scale(1.5_f32)
             .high_noise_sigmas(vec![1.0, 0.25])
             .high_noise_scheduler(Scheduler::KARRAS_SCHEDULER)
             .high_noise_timestep_shift(42)
-            .high_noise_flow_shift(3.0)
+            .high_noise_flow_shift(3.0_f32)
             .video_hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires, None)
             .build()
             .unwrap();
@@ -3747,10 +3747,9 @@ mod tests {
         let image_config = ConfigBuilder::default()
             .prompt("a lovely cat driving a sport car")
             .pulid_id_embedding(PathBuf::from("./pulid-id.safetensors"))
-            .pulid_id_weight(0.75)
-            .img_cfg_scale(2.5)
+            .pulid_id_weight(0.75_f32)
+            .img_cfg_scale(2.5_f32)
             .qwen_image_layers(5)
-            .increase_ref_index(true)
             .build()
             .unwrap();
         assert_eq!(
@@ -3760,7 +3759,6 @@ mod tests {
         assert_eq!(image_config.pulid_id_weight, 0.75);
         assert_eq!(image_config.img_cfg_scale, 2.5);
         assert_eq!(image_config.qwen_image_layers, 5);
-        assert!(image_config.increase_ref_index);
 
         let taylor = TaylorSeerCacheParamsBuilder::default()
             .n_derivatives(3)
