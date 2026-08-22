@@ -839,6 +839,82 @@ pub enum ScmPolicy {
     Dynamic,
 }
 
+/// Sampling parameters shared by image and video generation, mirroring
+/// `sd_sample_params_t` from stable-diffusion.cpp.
+#[derive(Builder, Debug, Clone)]
+#[builder(
+    setter(into, strip_option),
+    build_fn(error = "ConfigBuilderError", validate = "Self::validate")
+)]
+pub struct SampleParams {
+    /// Sampling method (default: [SampleMethod::SAMPLE_METHOD_COUNT], auto-detect from model)
+    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
+    sampling_method: SampleMethod,
+
+    /// Number of sample steps (default: 20)
+    #[builder(default = "20")]
+    steps: i32,
+
+    /// eta in DDIM, only for DDIM/TCD/res_multistep/res_2s (default: 0)
+    #[builder(default = "0.")]
+    eta: f32,
+
+    /// Denoiser sigma schedule (default: [Scheduler::SCHEDULER_COUNT], auto-detect from model)
+    #[builder(default = "Scheduler::SCHEDULER_COUNT")]
+    scheduler: Scheduler,
+
+    /// Custom sigma values for the sampler (overrides the scheduler schedule)
+    #[builder(default = "Default::default()")]
+    sigmas: Vec<f32>,
+
+    /// Unconditional guidance scale (default: 7.0)
+    #[builder(default = "7.0")]
+    cfg_scale: f32,
+
+    /// Image conditioning guidance scale. Non-finite values inherit cfg_scale.
+    #[builder(default = "f32::INFINITY")]
+    img_cfg_scale: f32,
+
+    /// Distilled guidance scale for models with guidance input (default: 3.5)
+    #[builder(default = "3.5")]
+    guidance: f32,
+
+    /// skip layer guidance (SLG) scale, only for DiT models: (default: 0)
+    #[builder(default = "0.")]
+    slg_scale: f32,
+
+    /// Layers to skip for SLG steps: (default: [7,8,9])
+    #[builder(default = "vec![7, 8, 9]")]
+    skip_layer: Vec<i32>,
+
+    /// SLG enabling point: (default: 0.01)
+    #[builder(default = "0.01")]
+    skip_layer_start: f32,
+
+    /// SLG disabling point: (default: 0.2)
+    #[builder(default = "0.2")]
+    skip_layer_end: f32,
+}
+
+impl SampleParamsBuilder {
+    fn validate(&self) -> Result<(), ConfigBuilderError> {
+        if let Some(steps) = self.steps {
+            if steps <= 0 {
+                return Err(ConfigBuilderError::ValidationError(
+                    "steps must be greater than 0".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for SampleParams {
+    fn default() -> Self {
+        SampleParamsBuilder::default().build().unwrap()
+    }
+}
+
 /// Hires parameters
 #[derive(Builder, Debug, Clone)]
 pub struct HiresParams {
@@ -1043,10 +1119,6 @@ pub struct ModelConfig {
     /// Otherwise, [Scheduler::DISCRETE_SCHEDULER] is used.
     #[builder(default = "Scheduler::SCHEDULER_COUNT")]
     scheduler: Scheduler,
-
-    /// Custom sigma values for the sampler
-    #[builder(default = "Default::default()")]
-    sigmas: Vec<f32>,
 
     /// Prediction type override (default: PREDICTION_COUNT)
     #[builder(default = "Prediction::PREDICTION_COUNT")]
@@ -1506,7 +1578,6 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .rng(value.rng)
             .sampler_rng_type(value.sampler_rng_type)
             .scheduler(value.scheduler)
-            .sigmas(value.sigmas.clone())
             .prediction(value.prediction)
             .vae_on_cpu(value.vae_on_cpu)
             .clip_on_cpu(value.clip_on_cpu)
@@ -1600,17 +1671,9 @@ pub struct Config {
     #[builder(default = "\"\".into()")]
     negative_prompt: CLibString,
 
-    /// Unconditional guidance scale (default: 7.0)
-    #[builder(default = "7.0")]
-    cfg_scale: f32,
-
-    /// Image conditioning guidance scale. Non-finite values inherit cfg_scale.
-    #[builder(default = "f32::INFINITY")]
-    img_cfg_scale: f32,
-
-    /// Distilled guidance scale for models with guidance input (default: 3.5)
-    #[builder(default = "3.5")]
-    guidance: f32,
+    /// Sampling parameters (steps, guidance, scheduler, sigmas, ...)
+    #[builder(default = "SampleParams::default()", setter(custom))]
+    sample_params: SampleParams,
 
     /// Strength for noising/unnoising (default: 0.75)
     #[builder(default = "0.75")]
@@ -1641,20 +1704,6 @@ pub struct Config {
     #[builder(default = "512")]
     width: i32,
 
-    /// Sampling-method (default: [SampleMethod::SAMPLE_METHOD_COUNT]).
-    /// [SampleMethod::EULER_SAMPLE_METHOD] will be used for flux, sd3, wan, qwen_image.
-    /// Otherwise [SampleMethod::EULER_A_SAMPLE_METHOD] is used.
-    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
-    sampling_method: SampleMethod,
-
-    /// eta in DDIM, only for DDIM/TCD/res_multistep/res_2s (default: 0)
-    #[builder(default = "0.")]
-    eta: f32,
-
-    /// Number of sample steps (default: 20)
-    #[builder(default = "20")]
-    steps: i32,
-
     /// RNG seed (default: -1, use random seed for < 0)
     #[builder(default = "-1")]
     seed: i64,
@@ -1675,23 +1724,6 @@ pub struct Config {
     /// Apply canny preprocessor (edge detection) (default: false)
     #[builder(default = "false")]
     canny: bool,
-
-    /// skip layer guidance (SLG) scale, only for DiT models: (default: 0)
-    /// 0 means disabled, a value of 2.5 is nice for sd3.5 medium
-    #[builder(default = "0.")]
-    slg_scale: f32,
-
-    /// Layers to skip for SLG steps: (default: \[7,8,9\])
-    #[builder(default = "vec![7, 8, 9]")]
-    skip_layer: Vec<i32>,
-
-    /// SLG enabling point: (default: 0.01)
-    #[builder(default = "0.01")]
-    skip_layer_start: f32,
-
-    /// SLG disabling point: (default: 0.2)
-    #[builder(default = "0.2")]
-    skip_layer_end: f32,
 
     #[builder(default = "Self::cache_init()", private)]
     cache: (sd_cache_params_t, Option<CLibString>),
@@ -1744,17 +1776,13 @@ pub struct VideoConfig {
     #[builder(default = "\"\".into()")]
     negative_prompt: CLibString,
 
-    /// Unconditional guidance scale (default: 7.0)
-    #[builder(default = "7.0")]
-    cfg_scale: f32,
+    /// Sampling parameters for the main denoising phase
+    #[builder(default = "SampleParams::default()", setter(custom))]
+    sample_params: SampleParams,
 
-    /// Image conditioning guidance scale. Non-finite values inherit cfg_scale.
-    #[builder(default = "f32::INFINITY")]
-    img_cfg_scale: f32,
-
-    /// Distilled guidance scale for models with guidance input (default: 3.5)
-    #[builder(default = "3.5")]
-    guidance: f32,
+    /// Sampling parameters for the high-noise phase (Wan 2.2 MoE models)
+    #[builder(default = "SampleParams::default()", setter(custom))]
+    high_noise_sample_params: SampleParams,
 
     /// Strength for noising/unnoising (default: 0.75)
     #[builder(default = "0.75")]
@@ -1767,18 +1795,6 @@ pub struct VideoConfig {
     /// Image width, in pixel space (default: 512)
     #[builder(default = "512")]
     width: i32,
-
-    /// Sampling method for the main denoising phase
-    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
-    sampling_method: SampleMethod,
-
-    /// eta in DDIM, only for DDIM/TCD/res_multistep/res_2s (default: 0)
-    #[builder(default = "0.")]
-    eta: f32,
-
-    /// Number of sample steps (default: 20)
-    #[builder(default = "20")]
-    steps: i32,
 
     /// RNG seed (default: -1, use random seed)
     #[builder(default = "-1")]
@@ -1795,82 +1811,6 @@ pub struct VideoConfig {
     /// Ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
     #[builder(default = "ClipSkip::Unspecified")]
     clip_skip: ClipSkip,
-
-    /// skip layer guidance (SLG) scale, only for DiT models: (default: 0)
-    #[builder(default = "0.")]
-    slg_scale: f32,
-
-    /// Layers to skip for SLG steps: (default: [7,8,9])
-    #[builder(default = "vec![7, 8, 9]")]
-    skip_layer: Vec<i32>,
-
-    /// SLG enabling point: (default: 0.01)
-    #[builder(default = "0.01")]
-    skip_layer_start: f32,
-
-    /// SLG disabling point: (default: 0.2)
-    #[builder(default = "0.2")]
-    skip_layer_end: f32,
-
-    /// Number of high-noise sample steps (default: -1)
-    #[builder(default = "-1")]
-    high_noise_steps: i32,
-
-    /// Sampling method for the high-noise phase
-    #[builder(default = "SampleMethod::SAMPLE_METHOD_COUNT")]
-    high_noise_sampling_method: SampleMethod,
-
-    /// eta for the high-noise phase
-    #[builder(default = "0.")]
-    high_noise_eta: f32,
-
-    /// Extra parameters for high-noise sampling, in backend-specific string format
-    #[builder(default = "CLibString::default()")]
-    high_noise_extra_sample_params: CLibString,
-
-    /// Unconditional guidance scale for the high-noise phase (default: 7.0)
-    #[builder(default = "7.0")]
-    high_noise_cfg_scale: f32,
-
-    /// Image conditioning guidance scale for the high-noise phase.
-    #[builder(default = "f32::INFINITY")]
-    high_noise_img_cfg_scale: f32,
-
-    /// Distilled guidance scale for the high-noise phase (default: 3.5)
-    #[builder(default = "3.5")]
-    high_noise_guidance: f32,
-
-    /// skip layer guidance (SLG) scale for the high-noise phase
-    #[builder(default = "0.")]
-    high_noise_slg_scale: f32,
-
-    /// Layers to skip for high-noise SLG steps: (default: [7,8,9])
-    #[builder(default = "vec![7, 8, 9]")]
-    high_noise_skip_layer: Vec<i32>,
-
-    /// High-noise SLG enabling point: (default: 0.01)
-    #[builder(default = "0.01")]
-    high_noise_skip_layer_start: f32,
-
-    /// High-noise SLG disabling point: (default: 0.2)
-    #[builder(default = "0.2")]
-    high_noise_skip_layer_end: f32,
-
-    /// Custom sigma values for the high-noise phase.
-    #[builder(default = "Default::default()")]
-    high_noise_sigmas: Vec<f32>,
-
-    /// Scheduler override for the high-noise phase; COUNT inherits the main scheduler.
-    #[builder(default = "Scheduler::SCHEDULER_COUNT")]
-    high_noise_scheduler: Scheduler,
-
-    /// Timestep shift override for the high-noise phase.
-    #[builder(default = "None")]
-    high_noise_timestep_shift: Option<i32>,
-
-    /// Flow shift override for the high-noise phase.
-    #[builder(default = "None")]
-    high_noise_flow_shift: Option<f32>,
 
     /// timestep boundary for Wan2.2 MoE model. (default: 0.875)
     #[builder(default = "0.875")]
@@ -2037,6 +1977,88 @@ impl ConfigBuilder {
             sd_cache_mode_t::SD_CACHE_CACHE_DIT;
         self
     }
+
+    /// Set the sampling parameters as a whole.
+    pub fn sample_params(&mut self, params: SampleParams) -> &mut Self {
+        self.sample_params = Some(params);
+        self
+    }
+
+    fn sample_params_mut(&mut self) -> &mut SampleParams {
+        self.sample_params.get_or_insert_with(SampleParams::default)
+    }
+
+    /// Convenience setter: number of sample steps.
+    pub fn steps(&mut self, steps: i32) -> &mut Self {
+        self.sample_params_mut().steps = steps;
+        self
+    }
+
+    /// Convenience setter: unconditional guidance scale.
+    pub fn cfg_scale(&mut self, cfg_scale: f32) -> &mut Self {
+        self.sample_params_mut().cfg_scale = cfg_scale;
+        self
+    }
+
+    /// Convenience setter: image conditioning guidance scale.
+    pub fn img_cfg_scale(&mut self, img_cfg_scale: f32) -> &mut Self {
+        self.sample_params_mut().img_cfg_scale = img_cfg_scale;
+        self
+    }
+
+    /// Convenience setter: distilled guidance scale.
+    pub fn guidance(&mut self, guidance: f32) -> &mut Self {
+        self.sample_params_mut().guidance = guidance;
+        self
+    }
+
+    /// Convenience setter: sampling method.
+    pub fn sampling_method(&mut self, sampling_method: SampleMethod) -> &mut Self {
+        self.sample_params_mut().sampling_method = sampling_method;
+        self
+    }
+
+    /// Convenience setter: eta in DDIM-like samplers.
+    pub fn eta(&mut self, eta: f32) -> &mut Self {
+        self.sample_params_mut().eta = eta;
+        self
+    }
+
+    /// Convenience setter: denoiser sigma schedule.
+    pub fn scheduler(&mut self, scheduler: Scheduler) -> &mut Self {
+        self.sample_params_mut().scheduler = scheduler;
+        self
+    }
+
+    /// Convenience setter: custom sigma values for the sampler.
+    pub fn sigmas(&mut self, sigmas: Vec<f32>) -> &mut Self {
+        self.sample_params_mut().sigmas = sigmas;
+        self
+    }
+
+    /// Convenience setter: skip layer guidance (SLG) scale.
+    pub fn slg_scale(&mut self, slg_scale: f32) -> &mut Self {
+        self.sample_params_mut().slg_scale = slg_scale;
+        self
+    }
+
+    /// Convenience setter: layers to skip for SLG steps.
+    pub fn skip_layer(&mut self, skip_layer: Vec<i32>) -> &mut Self {
+        self.sample_params_mut().skip_layer = skip_layer;
+        self
+    }
+
+    /// Convenience setter: SLG enabling point.
+    pub fn skip_layer_start(&mut self, skip_layer_start: f32) -> &mut Self {
+        self.sample_params_mut().skip_layer_start = skip_layer_start;
+        self
+    }
+
+    /// Convenience setter: SLG disabling point.
+    pub fn skip_layer_end(&mut self, skip_layer_end: f32) -> &mut Self {
+        self.sample_params_mut().skip_layer_end = skip_layer_end;
+        self
+    }
 }
 
 impl VideoConfigBuilder {
@@ -2110,6 +2132,171 @@ impl VideoConfigBuilder {
         custom_model: Option<&Path>,
     ) -> &mut Self {
         self.hires_params(upscaler, params, custom_model)
+    }
+
+    /// Set the sampling parameters for the main denoising phase.
+    pub fn sample_params(&mut self, params: SampleParams) -> &mut Self {
+        self.sample_params = Some(params);
+        self
+    }
+
+    /// Set the sampling parameters for the high-noise phase (Wan 2.2 MoE models).
+    pub fn high_noise_sample_params(&mut self, params: SampleParams) -> &mut Self {
+        self.high_noise_sample_params = Some(params);
+        self
+    }
+
+    fn sample_params_mut(&mut self) -> &mut SampleParams {
+        self.sample_params.get_or_insert_with(SampleParams::default)
+    }
+
+    fn high_noise_sample_params_mut(&mut self) -> &mut SampleParams {
+        self.high_noise_sample_params
+            .get_or_insert_with(SampleParams::default)
+    }
+
+    /// Convenience setter: number of sample steps for the main phase.
+    pub fn steps(&mut self, steps: i32) -> &mut Self {
+        self.sample_params_mut().steps = steps;
+        self
+    }
+
+    /// Convenience setter: number of sample steps for the high-noise phase.
+    pub fn high_noise_steps(&mut self, steps: i32) -> &mut Self {
+        self.high_noise_sample_params_mut().steps = steps;
+        self
+    }
+
+    /// Convenience setter: unconditional guidance scale for the main phase.
+    pub fn cfg_scale(&mut self, cfg_scale: f32) -> &mut Self {
+        self.sample_params_mut().cfg_scale = cfg_scale;
+        self
+    }
+
+    /// Convenience setter: unconditional guidance scale for the high-noise phase.
+    pub fn high_noise_cfg_scale(&mut self, cfg_scale: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().cfg_scale = cfg_scale;
+        self
+    }
+
+    /// Convenience setter: image conditioning guidance scale for the main phase.
+    pub fn img_cfg_scale(&mut self, img_cfg_scale: f32) -> &mut Self {
+        self.sample_params_mut().img_cfg_scale = img_cfg_scale;
+        self
+    }
+
+    /// Convenience setter: image conditioning guidance scale for the high-noise phase.
+    pub fn high_noise_img_cfg_scale(&mut self, img_cfg_scale: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().img_cfg_scale = img_cfg_scale;
+        self
+    }
+
+    /// Convenience setter: distilled guidance scale for the main phase.
+    pub fn guidance(&mut self, guidance: f32) -> &mut Self {
+        self.sample_params_mut().guidance = guidance;
+        self
+    }
+
+    /// Convenience setter: distilled guidance scale for the high-noise phase.
+    pub fn high_noise_guidance(&mut self, guidance: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().guidance = guidance;
+        self
+    }
+
+    /// Convenience setter: sampling method for the main phase.
+    pub fn sampling_method(&mut self, sampling_method: SampleMethod) -> &mut Self {
+        self.sample_params_mut().sampling_method = sampling_method;
+        self
+    }
+
+    /// Convenience setter: sampling method for the high-noise phase.
+    pub fn high_noise_sampling_method(&mut self, sampling_method: SampleMethod) -> &mut Self {
+        self.high_noise_sample_params_mut().sampling_method = sampling_method;
+        self
+    }
+
+    /// Convenience setter: eta for the main phase.
+    pub fn eta(&mut self, eta: f32) -> &mut Self {
+        self.sample_params_mut().eta = eta;
+        self
+    }
+
+    /// Convenience setter: eta for the high-noise phase.
+    pub fn high_noise_eta(&mut self, eta: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().eta = eta;
+        self
+    }
+
+    /// Convenience setter: denoiser sigma schedule for the main phase.
+    pub fn scheduler(&mut self, scheduler: Scheduler) -> &mut Self {
+        self.sample_params_mut().scheduler = scheduler;
+        self
+    }
+
+    /// Convenience setter: denoiser sigma schedule for the high-noise phase.
+    pub fn high_noise_scheduler(&mut self, scheduler: Scheduler) -> &mut Self {
+        self.high_noise_sample_params_mut().scheduler = scheduler;
+        self
+    }
+
+    /// Convenience setter: custom sigma values for the main phase.
+    pub fn sigmas(&mut self, sigmas: Vec<f32>) -> &mut Self {
+        self.sample_params_mut().sigmas = sigmas;
+        self
+    }
+
+    /// Convenience setter: custom sigma values for the high-noise phase.
+    pub fn high_noise_sigmas(&mut self, sigmas: Vec<f32>) -> &mut Self {
+        self.high_noise_sample_params_mut().sigmas = sigmas;
+        self
+    }
+
+    /// Convenience setter: SLG scale for the main phase.
+    pub fn slg_scale(&mut self, slg_scale: f32) -> &mut Self {
+        self.sample_params_mut().slg_scale = slg_scale;
+        self
+    }
+
+    /// Convenience setter: SLG scale for the high-noise phase.
+    pub fn high_noise_slg_scale(&mut self, slg_scale: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().slg_scale = slg_scale;
+        self
+    }
+
+    /// Convenience setter: layers to skip for SLG steps in the main phase.
+    pub fn skip_layer(&mut self, skip_layer: Vec<i32>) -> &mut Self {
+        self.sample_params_mut().skip_layer = skip_layer;
+        self
+    }
+
+    /// Convenience setter: layers to skip for SLG steps in the high-noise phase.
+    pub fn high_noise_skip_layer(&mut self, skip_layer: Vec<i32>) -> &mut Self {
+        self.high_noise_sample_params_mut().skip_layer = skip_layer;
+        self
+    }
+
+    /// Convenience setter: SLG enabling point for the main phase.
+    pub fn skip_layer_start(&mut self, skip_layer_start: f32) -> &mut Self {
+        self.sample_params_mut().skip_layer_start = skip_layer_start;
+        self
+    }
+
+    /// Convenience setter: SLG enabling point for the high-noise phase.
+    pub fn high_noise_skip_layer_start(&mut self, skip_layer_start: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().skip_layer_start = skip_layer_start;
+        self
+    }
+
+    /// Convenience setter: SLG disabling point for the main phase.
+    pub fn skip_layer_end(&mut self, skip_layer_end: f32) -> &mut Self {
+        self.sample_params_mut().skip_layer_end = skip_layer_end;
+        self
+    }
+
+    /// Convenience setter: SLG disabling point for the high-noise phase.
+    pub fn high_noise_skip_layer_end(&mut self, skip_layer_end: f32) -> &mut Self {
+        self.high_noise_sample_params_mut().skip_layer_end = skip_layer_end;
+        self
     }
 
     pub fn no_caching(&mut self) -> &mut Self {
@@ -2214,9 +2401,7 @@ impl From<&Config> for ConfigBuilder {
             .ref_images(value.ref_images.clone())
             .prompt(value.prompt.clone())
             .negative_prompt(value.negative_prompt.clone())
-            .cfg_scale(value.cfg_scale)
-            .img_cfg_scale(value.img_cfg_scale)
-            .guidance(value.guidance)
+            .sample_params(value.sample_params.clone())
             .strength(value.strength)
             .pm_style_strength(value.pm_style_strength)
             .pulid_id_embedding(value.pulid_id_embedding.clone())
@@ -2224,16 +2409,10 @@ impl From<&Config> for ConfigBuilder {
             .control_strength(value.control_strength)
             .height(value.height)
             .width(value.width)
-            .sampling_method(value.sampling_method)
-            .steps(value.steps)
             .seed(value.seed)
             .batch_count(value.batch_count)
             .qwen_image_layers(value.qwen_image_layers)
             .clip_skip(value.clip_skip)
-            .slg_scale(value.slg_scale)
-            .skip_layer(value.skip_layer.clone())
-            .skip_layer_start(value.skip_layer_start)
-            .skip_layer_end(value.skip_layer_end)
             .canny(value.canny)
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
@@ -2259,36 +2438,15 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .control_frames(value.control_frames)
             .prompt(value.prompt)
             .negative_prompt(value.negative_prompt)
-            .cfg_scale(value.cfg_scale)
-            .img_cfg_scale(value.img_cfg_scale)
-            .guidance(value.guidance)
+            .sample_params(value.sample_params.clone())
+            .high_noise_sample_params(value.high_noise_sample_params.clone())
             .strength(value.strength)
             .height(value.height)
             .width(value.width)
-            .sampling_method(value.sampling_method)
-            .eta(value.eta)
-            .steps(value.steps)
             .seed(value.seed)
             .video_frames(value.video_frames)
             .fps(value.fps)
             .clip_skip(value.clip_skip)
-            .slg_scale(value.slg_scale)
-            .skip_layer(value.skip_layer)
-            .skip_layer_start(value.skip_layer_start)
-            .skip_layer_end(value.skip_layer_end)
-            .high_noise_steps(value.high_noise_steps)
-            .high_noise_sampling_method(value.high_noise_sampling_method)
-            .high_noise_eta(value.high_noise_eta)
-            .high_noise_extra_sample_params(value.high_noise_extra_sample_params)
-            .high_noise_cfg_scale(value.high_noise_cfg_scale)
-            .high_noise_img_cfg_scale(value.high_noise_img_cfg_scale)
-            .high_noise_guidance(value.high_noise_guidance)
-            .high_noise_slg_scale(value.high_noise_slg_scale)
-            .high_noise_skip_layer(value.high_noise_skip_layer)
-            .high_noise_skip_layer_start(value.high_noise_skip_layer_start)
-            .high_noise_skip_layer_end(value.high_noise_skip_layer_end)
-            .high_noise_sigmas(value.high_noise_sigmas)
-            .high_noise_scheduler(value.high_noise_scheduler)
             .moe_boundary(value.moe_boundary)
             .vace_strength(value.vace_strength)
             .preview_mode(value.preview_mode)
@@ -2300,12 +2458,6 @@ impl From<VideoConfig> for VideoConfigBuilder {
                 hires_path.as_deref(),
             )
             .cache(value.cache.clone());
-        if let Some(timestep_shift) = value.high_noise_timestep_shift {
-            builder.high_noise_timestep_shift(timestep_shift);
-        }
-        if let Some(flow_shift) = value.high_noise_flow_shift {
-            builder.high_noise_flow_shift(flow_shift);
-        }
         builder
     }
 }
@@ -2828,38 +2980,41 @@ fn gen_img_maybe_progress(
             channel: 1,
             data: null_mut(),
         };
-        let mut layers = config.skip_layer.clone();
+        let mut layers = config.sample_params.skip_layer.clone();
         let guidance = sd_guidance_params_t {
-            txt_cfg: config.cfg_scale,
-            img_cfg: config.img_cfg_scale,
-            distilled_guidance: config.guidance,
+            txt_cfg: config.sample_params.cfg_scale,
+            img_cfg: config.sample_params.img_cfg_scale,
+            distilled_guidance: config.sample_params.guidance,
             slg: sd_slg_params_t {
                 layers: layers.as_mut_ptr(),
-                layer_count: config.skip_layer.len(),
-                layer_start: config.skip_layer_start,
-                layer_end: config.skip_layer_end,
-                scale: config.slg_scale,
+                layer_count: config.sample_params.skip_layer.len(),
+                layer_start: config.sample_params.skip_layer_start,
+                layer_end: config.sample_params.skip_layer_end,
+                scale: config.sample_params.slg_scale,
             },
         };
         let scheduler = if model_config.scheduler == Scheduler::SCHEDULER_COUNT {
-            sd_get_default_scheduler(sd_ctx, config.sampling_method)
+            sd_get_default_scheduler(sd_ctx, config.sample_params.sampling_method)
         } else {
             model_config.scheduler
         };
-        let sample_method = if config.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+        let sample_method = if config.sample_params.sampling_method
+            == SampleMethod::SAMPLE_METHOD_COUNT
+        {
             sd_get_default_sample_method(sd_ctx)
         } else {
-            config.sampling_method
+            config.sample_params.sampling_method
         };
+        let mut custom_sigmas = config.sample_params.sigmas.clone();
         let sample_params = sd_sample_params_t {
             guidance,
             sample_method,
-            sample_steps: config.steps,
-            eta: config.eta,
+            sample_steps: config.sample_params.steps,
+            eta: config.sample_params.eta,
             scheduler,
             shifted_timestep: model_config.timestep_shift,
-            custom_sigmas: model_config.sigmas.as_mut_ptr(),
-            custom_sigmas_count: model_config.sigmas.len() as i32,
+            custom_sigmas: custom_sigmas.as_mut_ptr(),
+            custom_sigmas_count: custom_sigmas.len() as i32,
             flow_shift: model_config.flow_shift,
             extra_sample_args: model_config.extra_sample_params.as_optional_ptr(),
         };
@@ -3214,77 +3369,79 @@ fn gen_video_maybe_progress(
             data: null_mut(),
         };
 
-        let mut layers = config.skip_layer.clone();
+        let mut layers = config.sample_params.skip_layer.clone();
         let guidance = make_guidance(
-            config.cfg_scale,
-            config.img_cfg_scale,
-            config.guidance,
-            config.slg_scale,
+            config.sample_params.cfg_scale,
+            config.sample_params.img_cfg_scale,
+            config.sample_params.guidance,
+            config.sample_params.slg_scale,
             &mut layers,
-            config.skip_layer_start,
-            config.skip_layer_end,
+            config.sample_params.skip_layer_start,
+            config.sample_params.skip_layer_end,
         );
-        let mut high_noise_layers = config.high_noise_skip_layer.clone();
+        let mut high_noise_layers = config.high_noise_sample_params.skip_layer.clone();
         let high_noise_guidance = make_guidance(
-            config.high_noise_cfg_scale,
-            config.high_noise_img_cfg_scale,
-            config.high_noise_guidance,
-            config.high_noise_slg_scale,
+            config.high_noise_sample_params.cfg_scale,
+            config.high_noise_sample_params.img_cfg_scale,
+            config.high_noise_sample_params.guidance,
+            config.high_noise_sample_params.slg_scale,
             &mut high_noise_layers,
-            config.high_noise_skip_layer_start,
-            config.high_noise_skip_layer_end,
+            config.high_noise_sample_params.skip_layer_start,
+            config.high_noise_sample_params.skip_layer_end,
         );
 
-        let sample_method = if config.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+        let sample_method = if config.sample_params.sampling_method
+            == SampleMethod::SAMPLE_METHOD_COUNT
+        {
             sd_get_default_sample_method(sd_ctx)
         } else {
-            config.sampling_method
+            config.sample_params.sampling_method
         };
-        let high_noise_sample_method =
-            if config.high_noise_sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
-                sd_get_default_sample_method(sd_ctx)
-            } else {
-                config.high_noise_sampling_method
-            };
+        let high_noise_sample_method = if config.high_noise_sample_params.sampling_method
+            == SampleMethod::SAMPLE_METHOD_COUNT
+        {
+            sd_get_default_sample_method(sd_ctx)
+        } else {
+            config.high_noise_sample_params.sampling_method
+        };
         let scheduler = if model_config.scheduler == Scheduler::SCHEDULER_COUNT {
             sd_get_default_scheduler(sd_ctx, sample_method)
         } else {
             model_config.scheduler
         };
-        let high_noise_scheduler = if config.high_noise_scheduler == Scheduler::SCHEDULER_COUNT {
+        let high_noise_scheduler = if config.high_noise_sample_params.scheduler
+            == Scheduler::SCHEDULER_COUNT
+        {
             scheduler
         } else {
-            config.high_noise_scheduler
+            config.high_noise_sample_params.scheduler
         };
-        let mut high_noise_sigmas = config.high_noise_sigmas.clone();
+        let mut high_noise_sigmas = config.high_noise_sample_params.sigmas.clone();
+        let mut custom_sigmas = config.sample_params.sigmas.clone();
 
         let sample_params = sd_sample_params_t {
             guidance,
             sample_method,
-            sample_steps: config.steps,
-            eta: config.eta,
+            sample_steps: config.sample_params.steps,
+            eta: config.sample_params.eta,
             scheduler,
             shifted_timestep: model_config.timestep_shift,
-            custom_sigmas: model_config.sigmas.as_mut_ptr(),
-            custom_sigmas_count: model_config.sigmas.len() as i32,
+            custom_sigmas: custom_sigmas.as_mut_ptr(),
+            custom_sigmas_count: custom_sigmas.len() as i32,
             flow_shift: model_config.flow_shift,
             extra_sample_args: model_config.extra_sample_params.as_optional_ptr(),
         };
         let high_noise_sample_params = sd_sample_params_t {
             guidance: high_noise_guidance,
             sample_method: high_noise_sample_method,
-            sample_steps: config.high_noise_steps,
-            eta: config.high_noise_eta,
+            sample_steps: config.high_noise_sample_params.steps,
+            eta: config.high_noise_sample_params.eta,
             scheduler: high_noise_scheduler,
-            shifted_timestep: config
-                .high_noise_timestep_shift
-                .unwrap_or(model_config.timestep_shift),
+            shifted_timestep: model_config.timestep_shift,
             custom_sigmas: high_noise_sigmas.as_mut_ptr(),
             custom_sigmas_count: high_noise_sigmas.len() as i32,
-            flow_shift: config
-                .high_noise_flow_shift
-                .unwrap_or(model_config.flow_shift),
-            extra_sample_args: config.high_noise_extra_sample_params.as_optional_ptr(),
+            flow_shift: model_config.flow_shift,
+            extra_sample_args: model_config.extra_sample_params.as_optional_ptr(),
         };
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
@@ -3541,9 +3698,9 @@ mod tests {
 
     use super::{
         AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
-        SampleMethod, Scheduler, TaylorSeerCacheParamsBuilder, Upscaler, VideoConfigBuilder,
-        audio_from_sd_audio, final_video_progress, gen_img, image_from_sd_image,
-        images_from_sd_frames,
+        SampleMethod, SampleParamsBuilder, Scheduler, TaylorSeerCacheParamsBuilder, Upscaler,
+        VideoConfigBuilder, audio_from_sd_audio, final_video_progress, gen_img,
+        image_from_sd_image, images_from_sd_frames,
     };
 
     #[test]
@@ -3715,33 +3872,34 @@ mod tests {
         let video_config = VideoConfigBuilder::default()
             .prompt("a lovely cat driving a sport car")
             .fps(24)
-            .high_noise_extra_sample_params("{\"high_noise\":true}")
             .img_cfg_scale(2.0_f32)
-            .high_noise_img_cfg_scale(1.5_f32)
-            .high_noise_sigmas(vec![1.0, 0.25])
-            .high_noise_scheduler(Scheduler::KARRAS_SCHEDULER)
-            .high_noise_timestep_shift(42)
-            .high_noise_flow_shift(3.0_f32)
+            .high_noise_sample_params(
+                SampleParamsBuilder::default()
+                    .img_cfg_scale(1.5_f32)
+                    .sigmas(vec![1.0, 0.25])
+                    .scheduler(Scheduler::KARRAS_SCHEDULER)
+                    .build()
+                    .unwrap(),
+            )
+            .sigmas(vec![1.0, 0.5])
             .video_hires_params(Upscaler::SD_HIRES_UPSCALER_LATENT, hires, None)
             .build()
             .unwrap();
         assert_eq!(video_config.fps, 24);
-        assert_eq!(video_config.img_cfg_scale, 2.0);
-        assert_eq!(video_config.high_noise_sigmas, vec![1.0, 0.25]);
+        assert_eq!(video_config.sample_params.img_cfg_scale, 2.0);
+        assert_eq!(video_config.sample_params.sigmas, vec![1.0, 0.5]);
+        assert_eq!(video_config.high_noise_sample_params.img_cfg_scale, 1.5);
+        assert_eq!(video_config.high_noise_sample_params.sigmas, vec![1.0, 0.25]);
         assert_eq!(
-            video_config
-                .high_noise_extra_sample_params
-                .0
-                .to_str()
-                .unwrap(),
-            "{\"high_noise\":true}"
+            video_config.high_noise_sample_params.scheduler,
+            Scheduler::KARRAS_SCHEDULER
         );
         assert_eq!(video_config.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
 
         let rebuilt = VideoConfigBuilder::from(video_config).build().unwrap();
         assert_eq!(rebuilt.fps, 24);
-        assert_eq!(rebuilt.high_noise_timestep_shift, Some(42));
-        assert_eq!(rebuilt.high_noise_flow_shift, Some(3.0));
+        assert_eq!(rebuilt.sample_params.sigmas, vec![1.0, 0.5]);
+        assert_eq!(rebuilt.high_noise_sample_params.sigmas, vec![1.0, 0.25]);
         assert_eq!(rebuilt.hires_params.1.custom_sigmas, vec![1.0, 0.5]);
 
         let image_config = ConfigBuilder::default()
@@ -3757,7 +3915,7 @@ mod tests {
             PathBuf::from("./pulid-id.safetensors")
         );
         assert_eq!(image_config.pulid_id_weight, 0.75);
-        assert_eq!(image_config.img_cfg_scale, 2.5);
+        assert_eq!(image_config.sample_params.img_cfg_scale, 2.5);
         assert_eq!(image_config.qwen_image_layers, 5);
 
         let taylor = TaylorSeerCacheParamsBuilder::default()

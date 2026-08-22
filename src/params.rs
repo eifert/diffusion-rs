@@ -7,9 +7,78 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{
-    Config, ConfigBuilder, ConfigBuilderError, ModelConfig, ModelConfigBuilder, VideoConfig,
-    VideoConfigBuilder,
+    Config, ConfigBuilder, ConfigBuilderError, ModelConfig, ModelConfigBuilder, SampleParams,
+    SampleParamsBuilder, VideoConfig, VideoConfigBuilder,
 };
+
+/// JSON-friendly sampling parameters mirroring [SampleParams].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SampleParamsJson {
+    pub sampling_method: Option<String>,
+    pub steps: Option<i32>,
+    pub eta: Option<f32>,
+    pub scheduler: Option<String>,
+    pub sigmas: Option<Vec<f32>>,
+    pub cfg_scale: Option<f32>,
+    pub img_cfg_scale: Option<f32>,
+    pub guidance: Option<f32>,
+    pub slg_scale: Option<f32>,
+    pub skip_layer: Option<Vec<i32>>,
+    pub skip_layer_start: Option<f32>,
+    pub skip_layer_end: Option<f32>,
+}
+
+impl TryFrom<SampleParamsJson> for SampleParams {
+    type Error = ConfigBuilderError;
+
+    fn try_from(p: SampleParamsJson) -> Result<Self, Self::Error> {
+        let mut b = SampleParamsBuilder::default();
+        if let Some(v) = p.sampling_method {
+            b.sampling_method(
+                crate::api::sampler_from_name(&v)
+                    .ok_or_else(|| ConfigBuilderError::ValidationError(format!("unknown sampling_method '{v}'")))?,
+            );
+        }
+        if let Some(v) = p.steps {
+            b.steps(v);
+        }
+        if let Some(v) = p.eta {
+            b.eta(v);
+        }
+        if let Some(v) = p.scheduler {
+            b.scheduler(
+                crate::api::scheduler_from_name(&v)
+                    .ok_or_else(|| ConfigBuilderError::ValidationError(format!("unknown scheduler '{v}'")))?,
+            );
+        }
+        if let Some(v) = p.sigmas {
+            b.sigmas(v);
+        }
+        if let Some(v) = p.cfg_scale {
+            b.cfg_scale(v);
+        }
+        if let Some(v) = p.img_cfg_scale {
+            b.img_cfg_scale(v);
+        }
+        if let Some(v) = p.guidance {
+            b.guidance(v);
+        }
+        if let Some(v) = p.slg_scale {
+            b.slg_scale(v);
+        }
+        if let Some(v) = p.skip_layer {
+            b.skip_layer(v);
+        }
+        if let Some(v) = p.skip_layer_start {
+            b.skip_layer_start(v);
+        }
+        if let Some(v) = p.skip_layer_end {
+            b.skip_layer_end(v);
+        }
+        b.build()
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -123,16 +192,12 @@ pub struct ImageParams {
     pub preview_output: Option<PathBuf>,
     pub width: Option<i32>,
     pub height: Option<i32>,
-    pub steps: Option<i32>,
     pub seed: Option<i64>,
     pub batch_count: Option<i32>,
-    pub cfg_scale: Option<f32>,
-    pub img_cfg_scale: Option<f32>,
-    pub guidance: Option<f32>,
     pub strength: Option<f32>,
-    pub eta: Option<f32>,
     pub control_strength: Option<f32>,
     pub qwen_image_layers: Option<i32>,
+    pub sample: Option<SampleParamsJson>,
 }
 
 impl TryFrom<ImageParams> for Config {
@@ -163,16 +228,14 @@ impl TryFrom<ImageParams> for Config {
         set!(negative_prompt);
         set!(width);
         set!(height);
-        set!(steps);
         set!(seed);
         set!(batch_count);
-        set!(cfg_scale);
-        set!(img_cfg_scale);
-        set!(guidance);
         set!(strength);
-        set!(eta);
         set!(control_strength);
         set!(qwen_image_layers);
+        if let Some(sample) = p.sample {
+            b.sample_params(SampleParams::try_from(sample)?);
+        }
         b.build()
     }
 }
@@ -187,25 +250,14 @@ pub struct VideoParams {
     pub control_frames: Vec<PathBuf>,
     pub width: Option<i32>,
     pub height: Option<i32>,
-    pub steps: Option<i32>,
     pub seed: Option<i64>,
     pub video_frames: Option<i32>,
     pub fps: Option<i32>,
-    pub cfg_scale: Option<f32>,
-    pub img_cfg_scale: Option<f32>,
-    pub guidance: Option<f32>,
     pub strength: Option<f32>,
-    pub eta: Option<f32>,
-    pub high_noise_steps: Option<i32>,
-    pub high_noise_cfg_scale: Option<f32>,
-    pub high_noise_img_cfg_scale: Option<f32>,
-    pub high_noise_guidance: Option<f32>,
-    pub high_noise_eta: Option<f32>,
-    pub high_noise_sigmas: Option<Vec<f32>>,
-    pub high_noise_timestep_shift: Option<i32>,
-    pub high_noise_flow_shift: Option<f32>,
     pub moe_boundary: Option<f32>,
     pub vace_strength: Option<f32>,
+    pub sample: Option<SampleParamsJson>,
+    pub high_noise_sample: Option<SampleParamsJson>,
 }
 
 impl TryFrom<VideoParams> for VideoConfig {
@@ -233,25 +285,18 @@ impl TryFrom<VideoParams> for VideoConfig {
         set!(negative_prompt);
         set!(width);
         set!(height);
-        set!(steps);
         set!(seed);
         set!(video_frames);
         set!(fps);
-        set!(cfg_scale);
-        set!(img_cfg_scale);
-        set!(guidance);
         set!(strength);
-        set!(eta);
-        set!(high_noise_steps);
-        set!(high_noise_cfg_scale);
-        set!(high_noise_img_cfg_scale);
-        set!(high_noise_guidance);
-        set!(high_noise_eta);
-        set!(high_noise_sigmas);
-        set!(high_noise_timestep_shift);
-        set!(high_noise_flow_shift);
         set!(moe_boundary);
         set!(vace_strength);
+        if let Some(sample) = p.sample {
+            b.sample_params(SampleParams::try_from(sample)?);
+        }
+        if let Some(high_noise_sample) = p.high_noise_sample {
+            b.high_noise_sample_params(SampleParams::try_from(high_noise_sample)?);
+        }
         b.build()
     }
 }
