@@ -141,7 +141,7 @@ const SCHEDULERS: [Scheduler; Scheduler::SCHEDULER_COUNT as usize] = [
     Scheduler::BETA_SCHEDULER,
 ];
 // The sd_type_t enum has gaps in its discriminants, so the list is shorter than SD_TYPE_COUNT.
-const WEIGHT_TYPES: [WeightType; 34] = [
+const WEIGHT_TYPES: [WeightType; 37] = [
     WeightType::SD_TYPE_F32,
     WeightType::SD_TYPE_F16,
     WeightType::SD_TYPE_Q4_0,
@@ -176,6 +176,9 @@ const WEIGHT_TYPES: [WeightType; 34] = [
     WeightType::SD_TYPE_MXFP4,
     WeightType::SD_TYPE_NVFP4,
     WeightType::SD_TYPE_Q1_0,
+    WeightType::SD_TYPE_Q2_0,
+    WeightType::SD_TYPE_F8_E4M3,
+    WeightType::SD_TYPE_F8_E5M2,
 ];
 // Keep these assertions in sync with stable-diffusion.cpp so enum drift fails the build.
 const _: [(); 0] = [(); SampleMethod::EULER_SAMPLE_METHOD as usize];
@@ -251,7 +254,10 @@ const _: [(); 35] = [(); WeightType::SD_TYPE_TQ2_0 as usize];
 const _: [(); 39] = [(); WeightType::SD_TYPE_MXFP4 as usize];
 const _: [(); 40] = [(); WeightType::SD_TYPE_NVFP4 as usize];
 const _: [(); 41] = [(); WeightType::SD_TYPE_Q1_0 as usize];
-const _: [(); 42] = [(); WeightType::SD_TYPE_COUNT as usize];
+const _: [(); 42] = [(); WeightType::SD_TYPE_Q2_0 as usize];
+const _: [(); 43] = [(); WeightType::SD_TYPE_F8_E4M3 as usize];
+const _: [(); 44] = [(); WeightType::SD_TYPE_F8_E5M2 as usize];
+const _: [(); 45] = [(); WeightType::SD_TYPE_COUNT as usize];
 type SdLogger = dyn Fn(LogLevel, &str) + Send + Sync + 'static;
 static SD_LOGGER: OnceLock<RwLock<Option<Arc<SdLogger>>>> = OnceLock::new();
 static SAMPLER_NAMES: OnceLock<Vec<String>> = OnceLock::new();
@@ -1497,7 +1503,10 @@ impl ModelConfig {
                 sd_ctx_params.force_sdxl_vae_conv_scale = self.force_sdxl_vae_conv_scale;
                 sd_ctx_params.vae_format = self.vae_format;
                 sd_ctx_params.max_vram = max_vram.as_optional_ptr();
-                sd_ctx_params.stream_layers = self.stream_layers;
+                // Upstream replaced stream_layers with automatic layer streaming under
+                // max_vram; disable_prefetch only turns off the async next-segment
+                // prefetch. Keep the old builder flag working as an on/off switch.
+                sd_ctx_params.disable_prefetch = !self.stream_layers;
                 sd_ctx_params.eager_load = self.eager_load;
                 sd_ctx_params.backend = backend.as_optional_ptr();
                 sd_ctx_params.params_backend = params_backend.as_optional_ptr();
@@ -3641,12 +3650,14 @@ fn gen_video_maybe_progress(
 
         let mut frames_out: *mut sd_image_t = null_mut();
         let mut audio_out: *mut sd_audio_t = null_mut();
+        let mut fps_out: i32 = 0;
         let success = generate_video(
             sd_ctx,
             &sd_vid_gen_params,
             &mut frames_out,
             &mut num_frames_out,
             &mut audio_out,
+            &mut fps_out,
         );
         let ret = {
             if !success || frames_out.is_null() {
