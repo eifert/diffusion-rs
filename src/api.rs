@@ -139,6 +139,7 @@ const SCHEDULERS: [Scheduler; Scheduler::SCHEDULER_COUNT as usize] = [
     Scheduler::FLUX2_SCHEDULER,
     Scheduler::FLUX_SCHEDULER,
     Scheduler::BETA_SCHEDULER,
+    Scheduler::LLADA_IMAGE_SCHEDULER,
 ];
 // The sd_type_t enum has gaps in its discriminants, so the list is shorter than SD_TYPE_COUNT.
 const WEIGHT_TYPES: [WeightType; 37] = [
@@ -219,7 +220,8 @@ const _: [(); 12] = [(); Scheduler::LOGIT_NORMAL_SCHEDULER as usize];
 const _: [(); 13] = [(); Scheduler::FLUX2_SCHEDULER as usize];
 const _: [(); 14] = [(); Scheduler::FLUX_SCHEDULER as usize];
 const _: [(); 15] = [(); Scheduler::BETA_SCHEDULER as usize];
-const _: [(); 16] = [(); Scheduler::SCHEDULER_COUNT as usize];
+const _: [(); 16] = [(); Scheduler::LLADA_IMAGE_SCHEDULER as usize];
+const _: [(); 17] = [(); Scheduler::SCHEDULER_COUNT as usize];
 const _: [(); 0] = [(); WeightType::SD_TYPE_F32 as usize];
 const _: [(); 1] = [(); WeightType::SD_TYPE_F16 as usize];
 const _: [(); 2] = [(); WeightType::SD_TYPE_Q4_0 as usize];
@@ -2742,9 +2744,40 @@ fn sd_image_len(img: sd_image_t) -> Option<usize> {
     width.checked_mul(height)?.checked_mul(channels)
 }
 
-fn image_from_sd_image(img: sd_image_t) -> Option<RgbImage> {
+/// Normalize the raw pixel data of an [`sd_image_t`] into a tightly packed RGB byte buffer.
+///
+/// stable-diffusion.cpp returns 1-, 3- or 4-channel images depending on the model. Qwen Image
+/// 2.1 and Qwen Image Layered decode to RGBA, so `channel` is 4 for those models. The `image`
+/// crate's `ImageBuffer::from_raw` only checks that the buffer is *at least* large enough, so
+/// handing a 4-channel buffer to an `RgbImage` silently reinterprets the pixels and produces
+/// shifted, broken output. Normalize to RGB here instead.
+fn sd_image_to_rgb_bytes(img: sd_image_t) -> Option<Vec<u8>> {
     let len = sd_image_len(img)?;
-    let buffer = unsafe { slice::from_raw_parts(img.data, len).to_vec() };
+    let buffer = unsafe { slice::from_raw_parts(img.data, len) };
+    match img.channel {
+        3 => Some(buffer.to_vec()),
+        4 => {
+            // Drop the alpha channel.
+            let mut rgb = Vec::with_capacity(len / 4 * 3);
+            for chunk in buffer.chunks_exact(4) {
+                rgb.extend_from_slice(&chunk[..3]);
+            }
+            Some(rgb)
+        }
+        1 => {
+            // Grayscale output: replicate the single channel across RGB.
+            let mut rgb = Vec::with_capacity(len * 3);
+            for &value in buffer {
+                rgb.extend_from_slice(&[value, value, value]);
+            }
+            Some(rgb)
+        }
+        _ => None,
+    }
+}
+
+fn image_from_sd_image(img: sd_image_t) -> Option<RgbImage> {
+    let buffer = sd_image_to_rgb_bytes(img)?;
     ImageBuffer::from_raw(img.width, img.height, buffer).map(RgbImage::from)
 }
 
@@ -2856,8 +2889,17 @@ unsafe fn upscale(
     unsafe {
         match upscaler_ctx {
             Some(upscaler_ctx) => {
+                // The ESRGAN upscaler only accepts 3-channel input, so normalize RGBA/grayscale
+                // output (e.g. Qwen Image 2.1) before upscaling. `rgb_buffer` keeps the pixels
+                // alive for the lifetime of `current_image`.
+                let mut rgb_buffer = sd_image_to_rgb_bytes(data).ok_or(DiffusionError::Upscaler)?;
+                let mut current_image = sd_image_t {
+                    width: data.width,
+                    height: data.height,
+                    channel: 3,
+                    data: rgb_buffer.as_mut_ptr(),
+                };
                 let upscale_factor = 4; // unused for RealESRGAN_x4plus_anime_6B.pth
-                let mut current_image = data;
                 let mut current_owner = None;
                 for _ in 0..upscale_repeats {
                     let mut images_out = null_mut();
@@ -4030,6 +4072,53 @@ mod tests {
             height: 1,
             channel: 3,
             data: null_mut(),
+        };
+
+        assert!(image_from_sd_image(image).is_none());
+    }
+
+    #[test]
+    fn test_image_from_sd_image_drops_alpha_channel() {
+        // Qwen Image 2.1 decodes to RGBA; the alpha channel must not shift the RGB pixels.
+        let mut pixels = vec![
+            255, 0, 0, 255, // red, opaque
+            0, 255, 0, 128, // green, half transparent
+        ];
+        let image = sd_image_t {
+            width: 2,
+            height: 1,
+            channel: 4,
+            data: pixels.as_mut_ptr(),
+        };
+
+        let converted = image_from_sd_image(image).expect("RGBA image should convert");
+        assert_eq!(converted.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(converted.get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn test_image_from_sd_image_expands_grayscale() {
+        let mut pixels = vec![10, 200];
+        let image = sd_image_t {
+            width: 2,
+            height: 1,
+            channel: 1,
+            data: pixels.as_mut_ptr(),
+        };
+
+        let converted = image_from_sd_image(image).expect("grayscale image should convert");
+        assert_eq!(converted.get_pixel(0, 0).0, [10, 10, 10]);
+        assert_eq!(converted.get_pixel(1, 0).0, [200, 200, 200]);
+    }
+
+    #[test]
+    fn test_image_from_sd_image_rejects_unsupported_channels() {
+        let mut pixels = vec![0u8; 4];
+        let image = sd_image_t {
+            width: 1,
+            height: 1,
+            channel: 2,
+            data: pixels.as_mut_ptr(),
         };
 
         assert!(image_from_sd_image(image).is_none());
