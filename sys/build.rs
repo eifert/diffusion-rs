@@ -5,7 +5,6 @@ use std::{
 };
 
 use cmake::Config;
-use fs_extra::dir;
 
 // Inspired by https://github.com/tazz4843/whisper-rs/blob/master/sys/build.rs
 
@@ -17,30 +16,20 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=stable-diffusion.cpp/.git");
+    // Track the whole vendored tree (Cargo scans directories recursively) so
+    // any edit under stable-diffusion.cpp/ triggers a native rebuild.
+    println!("cargo:rerun-if-changed=stable-diffusion.cpp");
     println!("cargo:rerun-if-changed=stable-diffusion.cpp/include/stable-diffusion.h");
 
-    // Copy stable-diffusion code into the build script directory
+    // Mirror stable-diffusion code into the build script directory.
+    // We sync instead of wipe-and-copy so that CMake/Ninja can do incremental
+    // builds: unchanged files keep their paths, contents and mtimes, so the
+    // native build system only recompiles what actually changed.
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let diffusion_root = out.join("stable-diffusion.cpp/");
 
-    if diffusion_root.exists() {
-        remove_dir_all(&diffusion_root).unwrap_or_else(|e| {
-            panic!(
-                "Failed to remove stale stable-diffusion sources from {}: {}",
-                diffusion_root.display(),
-                e
-            )
-        });
-    }
-    create_dir_all(&diffusion_root).unwrap();
-    dir::copy("./stable-diffusion.cpp", &out, &Default::default()).unwrap_or_else(|e| {
-        panic!(
-            "Failed to copy stable-diffusion sources into {}: {}",
-            diffusion_root.display(),
-            e
-        )
-    });
+    sync_tree(Path::new("./stable-diffusion.cpp"), &diffusion_root)
+        .unwrap_or_else(|e| panic!("Failed to sync stable-diffusion sources into {}: {}", diffusion_root.display(), e));
 
     // Bindgen
     let bindings = bindgen::Builder::default()
@@ -276,6 +265,69 @@ fn add_link_search_path(dir: &Path) -> std::io::Result<()> {
         println!("cargo:rustc-link-search={}", dir.display());
         for entry in read_dir(dir)? {
             add_link_search_path(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Mirror `src` into `dst` preserving mtimes of unchanged files.
+/// - New/changed files are copied with their source mtime.
+/// - Files removed from `src` are deleted from `dst` (except build dirs).
+/// This lets CMake/Ninja perform incremental rebuilds: unchanged files keep
+/// their original timestamps, so only edited sources are recompiled.
+fn sync_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    const SKIP_DIRS: &[&str] = &[".git", "build", "CMakeFiles", "examples", "tests", "docs"];
+
+    if !dst.exists() {
+        create_dir_all(dst)?;
+    }
+
+    // Sync files & recurse into subdirectories
+    for entry in read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if SKIP_DIRS.contains(&file_name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            sync_tree(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            let dst_mtime = dst_path.metadata().and_then(|m| m.modified()).ok();
+            let src_mtime = src_path.metadata()?.modified()?;
+
+            let needs_copy = match dst_mtime {
+                Some(t) => t != src_mtime,
+                None => true,
+            };
+            if needs_copy {
+                if dst_path.exists() {
+                    std::fs::remove_file(&dst_path)?;
+                }
+                std::fs::copy(&src_path, &dst_path)?;
+                // Restore source mtime so ninja's "is this file newer than the
+                // object file?" check behaves as if it built from src directly.
+                let filetime = filetime::FileTime::from_system_time(src_mtime);
+                filetime::set_file_times(&dst_path, filetime, filetime)?;
+            }
+        }
+    }
+
+    // Remove stale files/dirs that no longer exist in src (except skipped dirs)
+    for entry in read_dir(dst)? {
+        let entry = entry?;
+        let dst_path = entry.path();
+        let file_name = entry.file_name();
+        let src_path = src.join(&file_name);
+        if !src_path.exists() && !SKIP_DIRS.contains(&file_name.to_string_lossy().as_ref()) {
+            if entry.file_type()?.is_dir() {
+                remove_dir_all(&dst_path)?;
+            } else {
+                std::fs::remove_file(&dst_path)?;
+            }
         }
     }
     Ok(())
