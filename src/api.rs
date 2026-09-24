@@ -36,6 +36,7 @@ use diffusion_rs_sys::sd_get_default_sample_method;
 use diffusion_rs_sys::sd_get_default_scheduler;
 use diffusion_rs_sys::sd_guidance_params_t;
 use diffusion_rs_sys::sd_hires_params_t;
+use diffusion_rs_sys::sd_image_preprocess_params_t;
 use diffusion_rs_sys::sd_image_t;
 use diffusion_rs_sys::sd_img_gen_params_init;
 use diffusion_rs_sys::sd_img_gen_params_t;
@@ -1732,9 +1733,19 @@ pub struct Config {
     #[builder(default = "ClipSkip::Unspecified")]
     clip_skip: ClipSkip,
 
-    /// Apply canny preprocessor (edge detection) (default: false)
+    /// Apply canny preprocessor (edge detection) to the init image (default: false).
+    /// This is a shortcut that appends `target=init,canny=true` to
+    /// [Config::image_preprocess].
     #[builder(default = "false")]
     canny: bool,
+
+    /// Image preprocessing rules forwarded to stable-diffusion.cpp, as a
+    /// semicolon-separated list of `target=...,key=value` entries (for example
+    /// `target=init,mode=crop-resize,filter=lanczos;target=mask,filter=nearest-exact`).
+    /// Targets are `init`, `end`, `mask`, `control`, `ref`, `ip-adapter`, `id` and
+    /// `control-frame`. Leave empty to use the upstream input presets.
+    #[builder(default = "CLibString::default()")]
+    image_preprocess: CLibString,
 
     #[builder(default = "Self::cache_init()", private)]
     cache: (sd_cache_params_t, Option<CLibString>),
@@ -1834,6 +1845,14 @@ pub struct VideoConfig {
     /// Video-specific hires fix parameters and upscaler model.
     #[builder(default = "ModelConfigBuilder::hires_init()", setter(custom))]
     hires_params: (Upscaler, HiresParams, Option<CLibPath>),
+
+    /// Image preprocessing rules forwarded to stable-diffusion.cpp, as a
+    /// semicolon-separated list of `target=...,key=value` entries (for example
+    /// `target=init,mode=fit-pad,filter=bicubic;target=control-frame,index=0,canny=true`).
+    /// Targets are `init`, `end`, `mask`, `control`, `ref`, `ip-adapter`, `id` and
+    /// `control-frame`. Leave empty to use the upstream input presets.
+    #[builder(default = "CLibString::default()")]
+    image_preprocess: CLibString,
 
     #[builder(default = "ConfigBuilder::cache_init()", private)]
     cache: (sd_cache_params_t, Option<CLibString>),
@@ -2425,6 +2444,7 @@ impl From<&Config> for ConfigBuilder {
             .qwen_image_layers(value.qwen_image_layers)
             .clip_skip(value.clip_skip)
             .canny(value.canny)
+            .image_preprocess(value.image_preprocess.clone())
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
@@ -2460,6 +2480,7 @@ impl From<VideoConfig> for VideoConfigBuilder {
             .clip_skip(value.clip_skip)
             .moe_boundary(value.moe_boundary)
             .vace_strength(value.vace_strength)
+            .image_preprocess(value.image_preprocess.clone())
             .preview_mode(value.preview_mode)
             .preview_noisy(value.preview_noisy)
             .preview_interval(value.preview_interval)
@@ -2527,6 +2548,21 @@ fn append_key_value_args(defaults: &[String], overrides: &CLibString) -> CLibStr
         parts.push(overrides.to_string_lossy());
     }
     CLibString::from(parts.join(","))
+}
+
+/// Combine the user-supplied preprocessing rules with the legacy `canny`
+/// shortcut. The shortcut appends a `target=init,canny=true` rule so existing
+/// callers keep working after upstream replaced the old `--canny` flag.
+fn image_preprocess_rules(base: &CLibString, canny: bool) -> CLibString {
+    if !canny {
+        return base.clone();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !base.is_empty() {
+        parts.push(base.to_string_lossy());
+    }
+    parts.push("target=init,canny=true".to_owned());
+    CLibString::from(parts.join(";"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3298,6 +3334,10 @@ fn gen_img_maybe_progress(
         sd_img_gen_params.hires = hires;
         sd_img_gen_params.circular_x = model_config.circular || model_config.circular_x;
         sd_img_gen_params.circular_y = model_config.circular || model_config.circular_y;
+        let image_preprocess = image_preprocess_rules(&config.image_preprocess, config.canny);
+        sd_img_gen_params.image_preprocess = sd_image_preprocess_params_t {
+            rules: image_preprocess.as_optional_ptr(),
+        };
 
         let params_str = owned_native_string(sd_img_gen_params_to_str(&sd_img_gen_params))?;
 
@@ -3649,6 +3689,7 @@ fn gen_video_maybe_progress(
             config.hires_params.2.as_ref(),
             &mut hires_custom_sigmas,
         );
+        let image_preprocess = config.image_preprocess.clone();
         let sd_vid_gen_params = sd_vid_gen_params_t {
             loras: loras.as_ptr(),
             lora_count: loras.len() as u32,
@@ -3688,6 +3729,9 @@ fn gen_video_maybe_progress(
             hires,
             circular_x: model_config.circular || model_config.circular_x,
             circular_y: model_config.circular || model_config.circular_y,
+            image_preprocess: sd_image_preprocess_params_t {
+                rules: image_preprocess.as_optional_ptr(),
+            },
         };
 
         let mut frames_out: *mut sd_image_t = null_mut();
@@ -3753,7 +3797,7 @@ mod tests {
         AudioBuffer, ConfigBuilder, ExtProgress, GenerationCancelMode, HiresParamsBuilder,
         SampleMethod, SampleParamsBuilder, Scheduler, TaylorSeerCacheParamsBuilder, Upscaler,
         VideoConfigBuilder, audio_from_sd_audio, final_video_progress, gen_img,
-        image_from_sd_image, images_from_sd_frames,
+        image_from_sd_image, image_preprocess_rules, images_from_sd_frames,
     };
 
     #[test]
@@ -3985,6 +4029,59 @@ mod tests {
             .unwrap();
         assert_eq!(cached.cache.0.taylorseer_n_derivatives, 3);
         assert_eq!(cached.cache.0.max_cached_steps, 10);
+    }
+
+    #[test]
+    fn test_image_preprocess_rules_build() {
+        use super::CLibString;
+
+        // Empty rules and no canny fall back to the upstream input presets (NULL).
+        let empty = image_preprocess_rules(&CLibString::default(), false);
+        assert!(empty.as_optional_ptr().is_null());
+
+        // The legacy canny flag becomes an explicit init rule.
+        let canny = image_preprocess_rules(&CLibString::default(), true);
+        assert_eq!(
+            canny.to_string_lossy(),
+            "target=init,canny=true"
+        );
+
+        // User rules and the canny shortcut are joined with a semicolon.
+        let combined = image_preprocess_rules(
+            &CLibString::from("target=mask,filter=nearest-exact"),
+            true,
+        );
+        assert_eq!(
+            combined.to_string_lossy(),
+            "target=mask,filter=nearest-exact;target=init,canny=true"
+        );
+
+        let config = ConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .image_preprocess("target=ref,index=0,mode=none")
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.image_preprocess.to_string_lossy(),
+            "target=ref,index=0,mode=none"
+        );
+
+        let rebuilt = ConfigBuilder::from(&config).build().unwrap();
+        assert_eq!(
+            rebuilt.image_preprocess.to_string_lossy(),
+            "target=ref,index=0,mode=none"
+        );
+
+        let video_config = VideoConfigBuilder::default()
+            .prompt("a lovely cat driving a sport car")
+            .image_preprocess("target=control-frame,index=0,canny=true")
+            .build()
+            .unwrap();
+        let rebuilt_video = VideoConfigBuilder::from(video_config).build().unwrap();
+        assert_eq!(
+            rebuilt_video.image_preprocess.to_string_lossy(),
+            "target=control-frame,index=0,canny=true"
+        );
     }
 
     #[test]

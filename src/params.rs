@@ -198,6 +198,8 @@ pub struct ImageParams {
     pub control_strength: Option<f32>,
     pub qwen_image_layers: Option<i32>,
     pub sample: Option<SampleParamsJson>,
+    pub canny: Option<bool>,
+    pub image_preprocess: Option<String>,
 }
 
 impl TryFrom<ImageParams> for Config {
@@ -233,6 +235,8 @@ impl TryFrom<ImageParams> for Config {
         set!(strength);
         set!(control_strength);
         set!(qwen_image_layers);
+        set!(canny);
+        set!(image_preprocess);
         if let Some(sample) = p.sample {
             b.sample_params(SampleParams::try_from(sample)?);
         }
@@ -258,6 +262,7 @@ pub struct VideoParams {
     pub vace_strength: Option<f32>,
     pub sample: Option<SampleParamsJson>,
     pub high_noise_sample: Option<SampleParamsJson>,
+    pub image_preprocess: Option<String>,
 }
 
 impl TryFrom<VideoParams> for VideoConfig {
@@ -291,6 +296,7 @@ impl TryFrom<VideoParams> for VideoConfig {
         set!(strength);
         set!(moe_boundary);
         set!(vace_strength);
+        set!(image_preprocess);
         if let Some(sample) = p.sample {
             b.sample_params(SampleParams::try_from(sample)?);
         }
