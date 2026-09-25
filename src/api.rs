@@ -3114,11 +3114,11 @@ fn gen_img_maybe_progress(
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
             temporal_tiling: model_config.vae_temporal_tiling,
-            tile_size_x: model_config.vae_tile_size.0,
-            tile_size_y: model_config.vae_tile_size.1,
+            tile_size_w: model_config.vae_tile_size.0,
+            tile_size_h: model_config.vae_tile_size.1,
             target_overlap: model_config.vae_tile_overlap,
-            rel_size_x: model_config.vae_relative_tile_size.0,
-            rel_size_y: model_config.vae_relative_tile_size.1,
+            rel_size_w: model_config.vae_relative_tile_size.0,
+            rel_size_h: model_config.vae_relative_tile_size.1,
             extra_tiling_args: model_config.vae_extra_tiling_args.as_optional_ptr(),
         };
         let pm_params = sd_pm_params_t {
@@ -3537,11 +3537,11 @@ fn gen_video_maybe_progress(
         let vae_tiling_params = sd_tiling_params_t {
             enabled: model_config.vae_tiling,
             temporal_tiling: model_config.vae_temporal_tiling,
-            tile_size_x: model_config.vae_tile_size.0,
-            tile_size_y: model_config.vae_tile_size.1,
+            tile_size_w: model_config.vae_tile_size.0,
+            tile_size_h: model_config.vae_tile_size.1,
             target_overlap: model_config.vae_tile_overlap,
-            rel_size_x: model_config.vae_relative_tile_size.0,
-            rel_size_y: model_config.vae_relative_tile_size.1,
+            rel_size_w: model_config.vae_relative_tile_size.0,
+            rel_size_h: model_config.vae_relative_tile_size.1,
             extra_tiling_args: model_config.vae_extra_tiling_args.as_optional_ptr(),
         };
 
