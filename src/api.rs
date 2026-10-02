@@ -1091,8 +1091,8 @@ pub struct ModelConfig {
     #[builder(default = "false")]
     vae_tiling: bool,
 
-    /// Tile size for vae tiling (default: 32x32)
-    #[builder(default = "(32,32)")]
+    /// Tile size for vae tiling (default: 0x0)
+    #[builder(default = "(0,0)")]
     vae_tile_size: (i32, i32),
 
     /// Relative tile size for vae tiling, in fraction of image size if < 1, in number of tiles per dim if >=1 (overrides vae_tile_size)
@@ -3085,13 +3085,12 @@ fn gen_img_maybe_progress(
         } else {
             model_config.scheduler
         };
-        let sample_method = if config.sample_params.sampling_method
-            == SampleMethod::SAMPLE_METHOD_COUNT
-        {
-            sd_get_default_sample_method(sd_ctx)
-        } else {
-            config.sample_params.sampling_method
-        };
+        let sample_method =
+            if config.sample_params.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+                sd_get_default_sample_method(sd_ctx)
+            } else {
+                config.sample_params.sampling_method
+            };
         let mut custom_sigmas = config.sample_params.sigmas.clone();
         let sample_params = sd_sample_params_t {
             guidance,
@@ -3481,13 +3480,12 @@ fn gen_video_maybe_progress(
             config.high_noise_sample_params.skip_layer_end,
         );
 
-        let sample_method = if config.sample_params.sampling_method
-            == SampleMethod::SAMPLE_METHOD_COUNT
-        {
-            sd_get_default_sample_method(sd_ctx)
-        } else {
-            config.sample_params.sampling_method
-        };
+        let sample_method =
+            if config.sample_params.sampling_method == SampleMethod::SAMPLE_METHOD_COUNT {
+                sd_get_default_sample_method(sd_ctx)
+            } else {
+                config.sample_params.sampling_method
+            };
         let high_noise_sample_method = if config.high_noise_sample_params.sampling_method
             == SampleMethod::SAMPLE_METHOD_COUNT
         {
@@ -3500,13 +3498,12 @@ fn gen_video_maybe_progress(
         } else {
             model_config.scheduler
         };
-        let high_noise_scheduler = if config.high_noise_sample_params.scheduler
-            == Scheduler::SCHEDULER_COUNT
-        {
-            scheduler
-        } else {
-            config.high_noise_sample_params.scheduler
-        };
+        let high_noise_scheduler =
+            if config.high_noise_sample_params.scheduler == Scheduler::SCHEDULER_COUNT {
+                scheduler
+            } else {
+                config.high_noise_sample_params.scheduler
+            };
         let mut high_noise_sigmas = config.high_noise_sample_params.sigmas.clone();
         let mut custom_sigmas = config.sample_params.sigmas.clone();
 
@@ -3986,7 +3983,10 @@ mod tests {
         assert_eq!(video_config.sample_params.img_cfg_scale, 2.0);
         assert_eq!(video_config.sample_params.sigmas, vec![1.0, 0.5]);
         assert_eq!(video_config.high_noise_sample_params.img_cfg_scale, 1.5);
-        assert_eq!(video_config.high_noise_sample_params.sigmas, vec![1.0, 0.25]);
+        assert_eq!(
+            video_config.high_noise_sample_params.sigmas,
+            vec![1.0, 0.25]
+        );
         assert_eq!(
             video_config.high_noise_sample_params.scheduler,
             Scheduler::KARRAS_SCHEDULER
@@ -4041,16 +4041,11 @@ mod tests {
 
         // The legacy canny flag becomes an explicit init rule.
         let canny = image_preprocess_rules(&CLibString::default(), true);
-        assert_eq!(
-            canny.to_string_lossy(),
-            "target=init,canny=true"
-        );
+        assert_eq!(canny.to_string_lossy(), "target=init,canny=true");
 
         // User rules and the canny shortcut are joined with a semicolon.
-        let combined = image_preprocess_rules(
-            &CLibString::from("target=mask,filter=nearest-exact"),
-            true,
-        );
+        let combined =
+            image_preprocess_rules(&CLibString::from("target=mask,filter=nearest-exact"), true);
         assert_eq!(
             combined.to_string_lossy(),
             "target=mask,filter=nearest-exact;target=init,canny=true"
