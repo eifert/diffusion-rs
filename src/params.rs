@@ -117,6 +117,17 @@ pub struct ModelParams {
     pub rpc_servers: Option<String>,
     pub tensor_type_rules: Option<String>,
     pub model_args: Option<String>,
+    /// Path to a Hugging Face `tokenizer.json`, or slot assignments such as
+    /// `main=FILE,clip-l=FILE,clip-g=FILE`.
+    ///
+    /// A plain path is equivalent to `main=FILE`. Commas separate entries, so
+    /// quote the value when a path contains spaces. Unknown keys, empty paths,
+    /// malformed assignments, and duplicate slots are rejected.
+    ///
+    /// PiD and Lens require a `main` tokenizer; omitting this field keeps the
+    /// embedded tokenizer for other models. T5/SentencePiece Unigram
+    /// tokenizers are not supported.
+    pub tokenizer: Option<String>,
     pub flow_shift: Option<f32>,
     pub timestep_shift: Option<i32>,
     pub circular: Option<bool>,
@@ -170,6 +181,7 @@ impl TryFrom<ModelParams> for ModelConfig {
         set!(rpc_servers);
         set!(tensor_type_rules);
         set!(model_args);
+        set!(tokenizer);
         set!(flow_shift);
         set!(timestep_shift);
         set!(circular);
@@ -317,7 +329,7 @@ mod tests {
         assert!(Config::try_from(image).is_ok());
 
         let model: ModelParams = serde_json::from_str(
-            r#"{"model":"model.gguf","eager_load":true,"model_args":"foo=bar"}"#,
+            r#"{"model":"model.gguf","eager_load":true,"model_args":"foo=bar","tokenizer":"main=main.json,clip-l=clip_l.json"}"#,
         )
         .unwrap();
         assert!(ModelConfig::try_from(model).is_ok());

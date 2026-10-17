@@ -1253,6 +1253,12 @@ pub struct ModelConfig {
     /// Additional model-specific key/value arguments.
     #[builder(default = "CLibString::default()")]
     model_args: CLibString,
+
+    /// Path to a Hugging Face `tokenizer.json`, or slot assignments such as
+    /// `main=FILE,clip-l=FILE,clip-g=FILE`. A plain path is equivalent to `main=FILE`.
+    /// Required for PiD and Lens; other models keep their embedded tokenizer when omitted.
+    #[builder(default = "CLibString::default()")]
+    tokenizer: CLibString,
 }
 
 impl ModelConfigBuilder {
@@ -1517,6 +1523,7 @@ impl ModelConfig {
                 sd_ctx_params.auto_fit = self.auto_fit;
                 sd_ctx_params.rpc_servers = self.rpc_servers.as_optional_ptr();
                 sd_ctx_params.model_args = model_args.as_ptr();
+                sd_ctx_params.tokenizer = self.tokenizer.as_optional_ptr();
                 let ctx = new_sd_ctx(&sd_ctx_params);
                 if ctx.is_null() {
                     return Err(DiffusionError::ContextInit);
@@ -1621,7 +1628,8 @@ impl From<&ModelConfig> for ModelConfigBuilder {
             .split_mode(value.split_mode.clone())
             .auto_fit(value.auto_fit)
             .rpc_servers(value.rpc_servers.clone())
-            .model_args(value.model_args.clone());
+            .model_args(value.model_args.clone())
+            .tokenizer(value.tokenizer.clone());
 
         builder.lora_models_internal(value.lora_models.clone());
 
